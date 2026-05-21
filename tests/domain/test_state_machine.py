@@ -1,0 +1,13 @@
+import pytest
+
+from app.domain.enums import TaskStatus
+from app.domain.state_machine import can_transition, ensure_transition_allowed
+
+
+def test_can_transition_allows_valid_task_transition() -> None:
+    assert can_transition(TaskStatus.PENDING, TaskStatus.SCHEDULED)
+
+
+def test_ensure_transition_allowed_rejects_invalid_task_transition() -> None:
+    with pytest.raises(ValueError, match="Illegal state transition"):
+        ensure_transition_allowed(TaskStatus.SUCCESS, TaskStatus.RUNNING)

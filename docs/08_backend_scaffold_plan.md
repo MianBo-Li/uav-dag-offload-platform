@@ -200,7 +200,7 @@ app/core/config.py
 ```text
 APP_NAME
 APP_ENV
-DEBUG
+APP_DEBUG
 DATABASE_URL
 REDIS_URL
 API_V1_PREFIX
@@ -213,7 +213,7 @@ DEFAULT_SCHEDULER_STRATEGY
 ```text
 APP_NAME=uav-dag-offload-platform
 APP_ENV=local
-DEBUG=true
+APP_DEBUG=true
 API_V1_PREFIX=/api/v1
 DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/uav_dag
 REDIS_URL=redis://localhost:6379/0
