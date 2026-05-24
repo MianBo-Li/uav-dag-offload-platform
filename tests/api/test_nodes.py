@@ -132,6 +132,30 @@ def test_report_node_status_marks_busy_for_high_usage(client: TestClient) -> Non
     assert response.json()["status"] == "BUSY"
 
 
+def test_report_node_status_rejects_invalid_cpu_usage(client: TestClient) -> None:
+    create_response = client.post(
+        "/api/v1/nodes",
+        json={
+            "name": "UAV-001",
+            "node_type": "UAV",
+            "cpu_capacity": 100.0,
+            "memory_capacity_mb": 2048,
+        },
+    )
+    node_id = create_response.json()["id"]
+
+    response = client.post(
+        f"/api/v1/nodes/{node_id}/status",
+        json={
+            "cpu_usage": 101.0,
+            "memory_usage": 40.0,
+            "reported_at": datetime(2026, 5, 21, 12, 0, tzinfo=UTC).isoformat(),
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_get_unknown_node_returns_404(client: TestClient) -> None:
     response = client.get("/api/v1/nodes/00000000-0000-0000-0000-000000000001")
 
