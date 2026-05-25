@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.enums import TaskStatus
+from app.domain.enums import SubtaskStatus, TaskStatus
 
 
 class SubtaskCreate(BaseModel):
@@ -61,3 +61,36 @@ class DagTaskListResponse(BaseModel):
     page: int
     page_size: int
     total: int
+
+
+class DagSubtaskRead(BaseModel):
+    id: UUID
+    external_id: str
+    name: str
+    status: SubtaskStatus
+    compute_load: float
+    input_data_size_mb: float
+    output_data_size_mb: float
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DagDependencyRead(BaseModel):
+    from_: str = Field(alias="from")
+    to: str
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class DagTaskDetailRead(BaseModel):
+    id: UUID
+    name: str
+    status: TaskStatus
+    priority: int
+    deadline_at: datetime | None
+    subtasks: list[DagSubtaskRead]
+    dependencies: list[DagDependencyRead]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
