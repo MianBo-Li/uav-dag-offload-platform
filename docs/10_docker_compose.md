@@ -1,0 +1,289 @@
+# Docker Compose 本地开发环境
+
+## 1. 目标
+
+本阶段的目标是把当前后端系统整理成可一键启动的本地开发环境。
+
+当前 Compose 包含五个服务：
+
+```text
+api       FastAPI 后端服务
+postgres 业务事实数据库
+redis    临时状态和缓存预留
+prometheus 指标抓取和查询
+grafana    指标可视化
+```
+
+当前主流程仍然以 PostgreSQL 为事实来源。Redis 已经作为依赖预留，但还不是主业务链路的必需组件。
+
+## 2. 服务职责
+
+### 2.1 api
+
+`api` 服务运行 FastAPI 应用。
+
+启动命令：
+
+```text
+alembic upgrade head
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+含义：
+
+- 容器启动后先执行数据库迁移。
+- 迁移完成后启动 HTTP API。
+- API 对宿主机暴露 `8000` 端口。
+
+访问地址：
+
+```text
+http://localhost:8000/api/v1/health
+```
+
+### 2.2 postgres
+
+`postgres` 服务保存核心业务数据：
+
+- 节点。
+- 节点状态记录。
+- DAG 任务。
+- 子任务。
+- 依赖关系。
+- 调度计划。
+- 执行记录。
+
+本地端口：
+
+```text
+localhost:5432
+```
+
+容器内连接地址：
+
+```text
+postgres:5432
+```
+
+### 2.3 redis
+
+`redis` 服务用于后续临时状态和缓存能力，例如：
+
+- 最近心跳。
+- 短期锁。
+- 临时执行状态。
+- 后续异步队列辅助数据。
+
+本地端口：
+
+```text
+localhost:6379
+```
+
+容器内连接地址：
+
+```text
+redis:6379
+```
+
+### 2.4 prometheus
+
+`prometheus` 服务定时抓取 API 暴露的 `/metrics`。
+
+访问地址：
+
+```text
+http://localhost:9090
+```
+
+抓取目标：
+
+```text
+api:8000/metrics
+```
+
+配置文件：
+
+```text
+monitoring/prometheus/prometheus.yml
+```
+
+### 2.5 grafana
+
+`grafana` 服务用于查看 Prometheus 中的指标。
+
+访问地址：
+
+```text
+http://localhost:3000
+```
+
+默认账号：
+
+```text
+admin / admin
+```
+
+当前已经通过 provisioning 自动配置：
+
+- Prometheus 数据源。
+- `UAV DAG Overview` 仪表盘。
+
+## 3. localhost 和服务名的区别
+
+本机直接运行应用时，`.env` 可以写：
+
+```text
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/uav_dag
+REDIS_URL=redis://localhost:6379/0
+```
+
+因为应用进程运行在你的电脑上，`localhost` 指向你的电脑。
+
+在 Docker Compose 中，`api` 运行在容器里。此时容器里的 `localhost` 指向 `api` 容器自己，而不是 PostgreSQL 或 Redis。
+
+因此 Compose 里要写：
+
+```text
+DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/uav_dag
+REDIS_URL=redis://redis:6379/0
+```
+
+这里的 `postgres` 和 `redis` 是 Compose 服务名，Docker 会自动把服务名解析成对应容器地址。
+
+## 4. 常用命令
+
+启动：
+
+```powershell
+docker compose up --build
+```
+
+后台启动：
+
+```powershell
+docker compose up --build -d
+```
+
+查看日志：
+
+```powershell
+docker compose logs -f api
+```
+
+停止：
+
+```powershell
+docker compose down
+```
+
+停止并删除数据库卷：
+
+```powershell
+docker compose down -v
+```
+
+注意：`docker compose down -v` 会删除 PostgreSQL 数据卷，本地数据会丢失。
+
+## 5. 当前验证结果
+
+Docker Desktop 启动后，已经执行：
+
+```powershell
+docker compose up --build
+```
+
+当前服务状态：
+
+```text
+api       Up, port 8000
+postgres Up, healthy, port 5432
+redis    Up, healthy, port 6379
+prometheus Up, port 9090
+grafana    Up, port 3000
+```
+
+API 容器启动日志显示 Alembic 已经完成数据库迁移：
+
+```text
+20260521_0001 create node tables
+20260524_0002 create dag task tables
+20260526_0003 add subtask execution constraint
+20260531_0004 create schedule plan tables
+20260531_0005 create execution records
+```
+
+健康检查通过：
+
+```text
+http://localhost:8000/api/v1/health
+```
+
+返回：
+
+```json
+{
+  "status": "ok",
+  "service": "uav-dag-offload-platform",
+  "version": "0.1.0"
+}
+```
+
+Prometheus 文本指标接口通过：
+
+```text
+http://localhost:8000/metrics
+```
+
+示例指标：
+
+```text
+uav_dag_nodes_total 2
+uav_dag_tasks_total 1
+uav_dag_executions_total 3
+uav_dag_executions_by_status_total{status="SUCCESS"} 3
+uav_dag_execution_duration_ms_sum 2700
+```
+
+Prometheus 抓取验证通过：
+
+```text
+target: api:8000
+job: uav-dag-api
+health: up
+query: uav_dag_tasks_total
+```
+
+Grafana 验证通过：
+
+```text
+GET /api/health: ok
+dashboard: UAV DAG Overview
+url: http://localhost:3000/d/uav-dag-overview/uav-dag-overview
+```
+
+容器环境 API 冒烟流程也已通过：
+
+```text
+注册 UAV 节点
+-> 注册 EDGE 节点
+-> 上报节点状态
+-> 创建 3 个子任务 DAG
+-> 三轮调度
+-> 三轮执行
+-> 三次回传 SUCCESS
+-> 查询任务指标
+```
+
+最终结果：
+
+```json
+{
+  "task_status": "SUCCESS",
+  "execution_count": 3,
+  "success_rate": 1.0,
+  "local_execution_count": 1,
+  "edge_execution_count": 2,
+  "offload_rate": 0.6667
+}
+```

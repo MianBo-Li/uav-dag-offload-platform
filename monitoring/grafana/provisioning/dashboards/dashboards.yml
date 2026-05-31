@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: UAV DAG Dashboards
+    orgId: 1
+    folder: UAV DAG
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

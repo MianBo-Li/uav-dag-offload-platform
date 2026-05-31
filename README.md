@@ -17,3 +17,35 @@ Health check:
 ```text
 GET /api/v1/health
 ```
+
+Prometheus-style metrics:
+
+```text
+GET /metrics
+```
+
+## Docker Compose
+
+Start the local stack after Docker Desktop is running:
+
+```powershell
+docker compose up --build
+```
+
+Services:
+
+```text
+api       http://localhost:8000
+postgres  localhost:5432
+redis     localhost:6379
+prometheus http://localhost:9090
+grafana    http://localhost:3000
+```
+
+Grafana default login:
+
+```text
+admin / admin
+```
+
+See [docs/10_docker_compose.md](docs/10_docker_compose.md) for the learning notes and command reference.

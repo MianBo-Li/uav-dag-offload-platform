@@ -11,3 +11,8 @@ def test_can_transition_allows_valid_task_transition() -> None:
 def test_ensure_transition_allowed_rejects_invalid_task_transition() -> None:
     with pytest.raises(ValueError, match="Illegal state transition"):
         ensure_transition_allowed(TaskStatus.SUCCESS, TaskStatus.RUNNING)
+
+
+def test_canceled_task_cannot_be_scheduled_or_run() -> None:
+    assert not can_transition(TaskStatus.CANCELED, TaskStatus.SCHEDULED)
+    assert not can_transition(TaskStatus.CANCELED, TaskStatus.RUNNING)

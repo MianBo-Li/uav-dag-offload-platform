@@ -6,8 +6,9 @@ from app.core.errors import AppError
 from app.db.models.task import DagDependency, DagSubtask, DagTask
 from app.domain.dag import validate_dag
 from app.domain.enums import SubtaskStatus, TaskStatus
+from app.domain.state_machine import ensure_transition_allowed
 from app.repositories.task_repository import TaskRepository
-from app.schemas.task import DagTaskCreate
+from app.schemas.task import DagTaskCancelRequest, DagTaskCreate
 
 
 class TaskService:
@@ -49,6 +50,7 @@ class TaskService:
                     if subtask.external_id in successor_ids
                     else SubtaskStatus.READY
                 ),
+                execution_constraint=subtask.execution_constraint,
                 compute_load=subtask.compute_load,
                 input_data_size_mb=subtask.input_data_size_mb,
                 output_data_size_mb=subtask.output_data_size_mb,
@@ -91,3 +93,35 @@ class TaskService:
         page_size: int,
     ) -> tuple[list[DagTask], int]:
         return self.repository.list_tasks(status, page, page_size)
+
+    def list_subtasks(
+        self,
+        task_id: UUID,
+        status: SubtaskStatus | None,
+        page: int,
+        page_size: int,
+    ) -> tuple[list[DagSubtask], int]:
+        self.get_task(task_id)
+        return self.repository.list_subtasks(task_id, status, page, page_size)
+
+    def cancel_task(self, task_id: UUID, data: DagTaskCancelRequest) -> DagTask:
+        task = self.get_task(task_id)
+        try:
+            ensure_transition_allowed(task.status, TaskStatus.CANCELED)
+        except ValueError as exc:
+            raise AppError(
+                code="TASK_STATE_CONFLICT",
+                message=str(exc),
+                status_code=409,
+                details={
+                    "task_id": str(task_id),
+                    "current_status": task.status,
+                    "target_status": TaskStatus.CANCELED,
+                },
+            ) from exc
+
+        task.status = TaskStatus.CANCELED
+        task.failure_reason = data.reason
+        self.db.flush()
+        self.db.refresh(task)
+        return task

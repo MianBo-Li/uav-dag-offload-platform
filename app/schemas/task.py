@@ -4,7 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.enums import SubtaskStatus, TaskStatus
+from app.domain.enums import SubtaskExecutionConstraint, SubtaskStatus, TaskStatus
 
 
 class SubtaskCreate(BaseModel):
@@ -13,6 +13,9 @@ class SubtaskCreate(BaseModel):
     compute_load: float = Field(gt=0)
     input_data_size_mb: float = Field(ge=0)
     output_data_size_mb: float = Field(ge=0)
+    execution_constraint: SubtaskExecutionConstraint = (
+        SubtaskExecutionConstraint.OFFLOADABLE
+    )
     max_retries: int = Field(default=0, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -30,6 +33,10 @@ class DagTaskCreate(BaseModel):
     subtasks: list[SubtaskCreate] = Field(min_length=1)
     dependencies: list[DependencyCreate] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DagTaskCancelRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=255)
 
 
 class DagTaskRead(BaseModel):
@@ -68,9 +75,12 @@ class DagSubtaskRead(BaseModel):
     external_id: str
     name: str
     status: SubtaskStatus
+    execution_constraint: SubtaskExecutionConstraint
     compute_load: float
     input_data_size_mb: float
     output_data_size_mb: float
+    retry_count: int
+    max_retries: int
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -94,3 +104,17 @@ class DagTaskDetailRead(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DagSubtaskListResponse(BaseModel):
+    items: list[DagSubtaskRead]
+    page: int
+    page_size: int
+    total: int
+
+
+class DagTaskCancelResponse(BaseModel):
+    task_id: UUID
+    status: TaskStatus
+    reason: str | None
+    updated_at: datetime
