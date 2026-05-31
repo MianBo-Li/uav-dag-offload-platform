@@ -31,6 +31,12 @@ class SubtaskStatus(StrEnum):
     RETRYING = "RETRYING"
 
 
+class SubtaskExecutionConstraint(StrEnum):
+    OFFLOADABLE = "OFFLOADABLE"
+    LOCAL_ONLY = "LOCAL_ONLY"
+    EDGE_ONLY = "EDGE_ONLY"
+
+
 class SchedulePlanStatus(StrEnum):
     GENERATED = "GENERATED"
     APPLIED = "APPLIED"

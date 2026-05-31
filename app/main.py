@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.monitoring import router as monitoring_router
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.errors import AppError
@@ -28,6 +29,7 @@ def create_app() -> FastAPI:
         debug=settings.app_debug,
     )
     app.include_router(api_router, prefix=settings.api_v1_prefix)
+    app.include_router(monitoring_router)
     app.add_exception_handler(AppError, app_error_handler)
     return app
 

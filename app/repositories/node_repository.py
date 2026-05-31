@@ -50,6 +50,17 @@ class NodeRepository:
         )
         return items, total
 
+    def list_by_status(self, status: NodeStatus) -> list[Node]:
+        return list(self.db.scalars(select(Node).where(Node.status == status)))
+
+    def get_latest_status_record(self, node_id: UUID) -> NodeStatusRecord | None:
+        return self.db.scalar(
+            select(NodeStatusRecord)
+            .where(NodeStatusRecord.node_id == node_id)
+            .order_by(NodeStatusRecord.reported_at.desc())
+            .limit(1)
+        )
+
     def create_status_record(self, record: NodeStatusRecord) -> NodeStatusRecord:
         self.db.add(record)
         self.db.flush()
