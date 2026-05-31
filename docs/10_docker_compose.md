@@ -287,3 +287,54 @@ url: http://localhost:3000/d/uav-dag-overview/uav-dag-overview
   "offload_rate": 0.6667
 }
 ```
+
+## 6. Celery / RabbitMQ 异步执行补充
+
+当前 Compose 已经补充异步执行链路：
+
+```text
+rabbitmq  消息队列，API 把 execution_id 投递到这里
+worker    Celery Worker，从 RabbitMQ 消费 execution_id 并模拟执行
+```
+
+访问地址：
+
+```text
+RabbitMQ AMQP: localhost:5672
+RabbitMQ UI:   http://localhost:15672
+默认账号:      guest / guest
+```
+
+Worker 启动命令：
+
+```text
+celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=1
+```
+
+Docker 环境中开启了自动投递：
+
+```text
+EXECUTION_AUTO_ENQUEUE_ENABLED=true
+```
+
+因此在 Docker 环境里调用：
+
+```text
+POST /api/v1/tasks/{task_id}/execute
+```
+
+API 会先创建 `execution_records`，提交数据库事务，然后把 execution id 投递给 RabbitMQ。Worker 消费消息后会调用同一套 `ExecutionService.report_result()`，把子任务推进到 `SUCCESS`。
+
+当前异步冒烟验证已经通过：
+
+```text
+queued_count: 1
+subtask_status: SUCCESS
+task_status: SUCCESS
+```
+
+更详细的学习记录见：
+
+```text
+docs/11_async_execution_plan.md
+```

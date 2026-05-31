@@ -29,6 +29,7 @@ from app.schemas.task import (
     DagTaskListResponse,
     DagTaskRead,
 )
+from app.services.execution_dispatcher import ExecutionDispatcher
 from app.services.execution_service import ExecutionService
 from app.services.metrics_service import MetricsService
 from app.services.scheduling_service import SchedulingService
@@ -199,12 +200,23 @@ def execute_task(
 ) -> ExecutionStartResponse:
     result = ExecutionService(db).start_execution(task_id, payload.schedule_plan_id)
     db.commit()
+    simulation = payload.simulation
+    queued_count = ExecutionDispatcher().enqueue_started_executions(
+        result.execution_ids,
+        result_status=(
+            simulation.result_status if simulation is not None else ExecutionStatus.SUCCESS
+        ),
+        duration_ms=simulation.duration_ms if simulation is not None else None,
+        output_summary=simulation.output_summary if simulation is not None else None,
+        failure_reason=simulation.failure_reason if simulation is not None else None,
+    )
     return ExecutionStartResponse(
         task_id=result.task_id,
         schedule_plan_id=result.schedule_plan_id,
         status=result.status,
         execution_count=result.execution_count,
         execution_ids=result.execution_ids,
+        queued_count=queued_count,
     )
 
 

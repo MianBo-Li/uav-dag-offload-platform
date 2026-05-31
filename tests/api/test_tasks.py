@@ -89,6 +89,16 @@ def _local_capture_task_payload() -> dict[str, object]:
     return payload
 
 
+def _non_retryable_local_capture_task_payload() -> dict[str, object]:
+    payload = _local_capture_task_payload()
+    subtasks = payload["subtasks"]
+    assert isinstance(subtasks, list)
+    capture_subtask = subtasks[0]
+    assert isinstance(capture_subtask, dict)
+    capture_subtask["max_retries"] = 0
+    return payload
+
+
 def test_create_task_accepts_valid_dag(client: TestClient) -> None:
     response = client.post("/api/v1/tasks", json=_valid_task_payload())
 
@@ -462,6 +472,7 @@ def test_execute_task_starts_execution_from_schedule_plan(client: TestClient) ->
     assert body["schedule_plan_id"] == schedule_id
     assert body["status"] == "RUNNING"
     assert body["execution_count"] == 1
+    assert body["queued_count"] == 0
 
     detail_response = client.get(f"/api/v1/tasks/{task_id}")
     detail_body = detail_response.json()
@@ -474,6 +485,21 @@ def test_execute_task_starts_execution_from_schedule_plan(client: TestClient) ->
 
     schedule_detail_response = client.get(f"/api/v1/schedules/{schedule_id}")
     assert schedule_detail_response.json()["status"] == "APPLIED"
+
+
+def test_execute_task_rejects_non_terminal_simulated_result_status(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/api/v1/tasks/00000000-0000-0000-0000-000000000001/execute",
+        json={
+            "schedule_plan_id": "00000000-0000-0000-0000-000000000001",
+            "simulation": {"result_status": "RUNNING"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert "detail" in response.json()
 
 
 def test_execute_task_rejects_unscheduled_task(client: TestClient) -> None:
@@ -641,6 +667,95 @@ def test_report_execution_success_marks_successor_ready(client: TestClient) -> N
     assert subtask_statuses["capture_image"] == "SUCCESS"
     assert subtask_statuses["detect_target"] == "READY"
     assert subtask_statuses["upload_report"] == "WAITING"
+
+
+def test_duplicate_execution_success_result_is_ignored(client: TestClient) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+    execution_id = execute_response.json()["execution_ids"][0]
+    first_response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "SUCCESS",
+            "duration_ms": 800,
+            "output_summary": "image captured",
+        },
+    )
+
+    duplicate_response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "SUCCESS",
+            "duration_ms": 999,
+            "output_summary": "duplicate result should be ignored",
+        },
+    )
+
+    assert first_response.status_code == 200
+    assert first_response.json()["accepted"] is True
+    assert duplicate_response.status_code == 200
+    duplicate_body = duplicate_response.json()
+    assert duplicate_body["accepted"] is False
+    assert duplicate_body["subtask_status"] == "SUCCESS"
+    assert duplicate_body["task_status"] == "RUNNING"
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["status"] == "SUCCESS"
+    assert execution["duration_ms"] == 800
+    assert execution["output_summary"] == "image captured"
+
+
+def test_late_failure_result_does_not_override_success(client: TestClient) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+    execution_id = execute_response.json()["execution_ids"][0]
+    client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "SUCCESS",
+            "duration_ms": 800,
+            "output_summary": "image captured",
+        },
+    )
+
+    response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "FAILED",
+            "duration_ms": 1000,
+            "failure_reason": "late failure should not override success",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is False
+    assert body["subtask_status"] == "SUCCESS"
+    assert body["task_status"] == "RUNNING"
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["status"] == "SUCCESS"
+    assert execution["failure_reason"] is None
 
 
 def test_schedule_running_task_after_success_schedules_ready_successor(
@@ -892,9 +1007,155 @@ def test_get_metrics_for_unknown_task_returns_404(client: TestClient) -> None:
     assert response.json()["error"]["code"] == "TASK_NOT_FOUND"
 
 
-def test_report_execution_failure_marks_task_failed(client: TestClient) -> None:
+def test_report_retryable_execution_failure_marks_subtask_ready(
+    client: TestClient,
+) -> None:
     _create_ready_nodes(client)
     create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+    execution_id = execute_response.json()["execution_ids"][0]
+
+    response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "FAILED",
+            "duration_ms": 800,
+            "failure_reason": "camera unavailable",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["subtask_status"] == "READY"
+    assert body["task_status"] == "RUNNING"
+
+    detail_response = client.get(f"/api/v1/tasks/{task_id}")
+    detail_body = detail_response.json()
+    assert detail_body["status"] == "RUNNING"
+    capture_subtask = next(
+        subtask
+        for subtask in detail_body["subtasks"]
+        if subtask["external_id"] == "capture_image"
+    )
+    assert capture_subtask["status"] == "READY"
+    assert capture_subtask["retry_count"] == 1
+
+
+def test_duplicate_retryable_failure_does_not_increment_retry_count_twice(
+    client: TestClient,
+) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+    execution_id = execute_response.json()["execution_ids"][0]
+    first_response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "FAILED",
+            "duration_ms": 800,
+            "failure_reason": "camera unavailable",
+        },
+    )
+
+    duplicate_response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "FAILED",
+            "duration_ms": 1000,
+            "failure_reason": "duplicate failure should be ignored",
+        },
+    )
+
+    assert first_response.status_code == 200
+    assert first_response.json()["accepted"] is True
+    assert duplicate_response.status_code == 200
+    duplicate_body = duplicate_response.json()
+    assert duplicate_body["accepted"] is False
+    assert duplicate_body["subtask_status"] == "READY"
+    assert duplicate_body["task_status"] == "RUNNING"
+
+    detail_response = client.get(f"/api/v1/tasks/{task_id}")
+    capture_subtask = next(
+        subtask
+        for subtask in detail_response.json()["subtasks"]
+        if subtask["external_id"] == "capture_image"
+    )
+    assert capture_subtask["status"] == "READY"
+    assert capture_subtask["retry_count"] == 1
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["status"] == "FAILED"
+    assert execution["duration_ms"] == 800
+    assert execution["failure_reason"] == "camera unavailable"
+
+
+def test_retry_ready_subtask_can_be_scheduled_and_executed_again(
+    client: TestClient,
+) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    first_schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    first_execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": first_schedule_response.json()["id"]},
+    )
+    first_execution_id = first_execute_response.json()["execution_ids"][0]
+    client.post(
+        f"/api/v1/executions/{first_execution_id}/result",
+        json={
+            "status": "FAILED",
+            "duration_ms": 800,
+            "failure_reason": "camera unavailable",
+        },
+    )
+
+    retry_schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    retry_execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": retry_schedule_response.json()["id"]},
+    )
+    retry_execution_id = retry_execute_response.json()["execution_ids"][0]
+
+    assert retry_execute_response.status_code == 202
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    attempts = {
+        item["id"]: item["attempt"] for item in executions_response.json()["items"]
+    }
+    assert attempts[first_execution_id] == 1
+    assert attempts[retry_execution_id] == 2
+
+
+def test_report_execution_failure_marks_task_failed(client: TestClient) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post(
+        "/api/v1/tasks",
+        json=_non_retryable_local_capture_task_payload(),
+    )
     task_id = create_response.json()["id"]
     schedule_response = client.post(
         f"/api/v1/tasks/{task_id}/schedule",

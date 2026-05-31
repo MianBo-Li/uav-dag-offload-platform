@@ -1104,6 +1104,66 @@ Grafana health: ok
 Grafana dashboard UAV DAG Overview: provisioned
 ```
 
+### 6.26 异步执行器与失败重试
+
+已完成：
+
+```text
+RabbitMQ
+Celery Worker
+POST /api/v1/tasks/{task_id}/execute 自动投递 execution_id
+Worker 自动回传模拟执行结果
+失败后按 max_retries 决定是否重新变为 READY
+```
+
+代表文件：
+
+- [app/api/v1/endpoints/tasks.py](../app/api/v1/endpoints/tasks.py)
+- [app/schemas/execution.py](../app/schemas/execution.py)
+- [app/services/execution_service.py](../app/services/execution_service.py)
+- [app/services/execution_dispatcher.py](../app/services/execution_dispatcher.py)
+- [app/worker/celery_app.py](../app/worker/celery_app.py)
+- [app/worker/tasks.py](../app/worker/tasks.py)
+- [docker-compose.yml](../docker-compose.yml)
+- [tests/services/test_execution_dispatcher.py](../tests/services/test_execution_dispatcher.py)
+- [tests/api/test_tasks.py](../tests/api/test_tasks.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+学到的内容：
+
+- API 进程不应该长期执行子任务，真实系统应把执行工作交给独立 Worker。
+- RabbitMQ 负责传递待执行消息，PostgreSQL 仍然是核心业务事实来源。
+- API 必须先提交数据库事务，再把 execution id 投递到消息队列，避免 Worker 先消费却查不到记录。
+- Worker 不直接散落修改数据库，而是复用 `ExecutionService.report_result()`，保证 API 回传和 Worker 回传遵守同一套状态规则。
+- `EXECUTION_AUTO_ENQUEUE_ENABLED=false` 时，本地 pytest 不依赖 RabbitMQ；Docker 环境中开启自动投递。
+- 执行失败不一定等于任务失败。只要 `retry_count < max_retries`，子任务会走：
+
+```text
+RUNNING -> FAILED -> RETRYING -> READY
+```
+
+- 重试次数用完后，子任务才会最终 `FAILED`，总任务才会进入 `FAILED`。
+- `execution_records.attempt = subtask.retry_count + 1`，用于记录每一次真实执行尝试。
+- 同一个 `execution_id` 的执行结果只接受一次，重复或迟到结果返回 `accepted=false`，不能再次推进状态。
+- 幂等和重试不同：重试会创建新的 `execution_record`，幂等是在保护同一次执行尝试不要被重复处理。
+
+当前验证：
+
+```text
+pytest: 85 passed
+ruff --no-cache: All checks passed
+docker compose config: passed
+Docker async success smoke: passed
+Docker async retry smoke: passed
+duplicate execution result idempotency tests: passed
+```
+
+详细专题说明见：
+
+```text
+docs/11_async_execution_plan.md
+```
+
 ## 7. 测试学习总结
 
 ### 7.1 测试分层
@@ -1149,7 +1209,7 @@ API 测试：
 截至 2026-05-31：
 
 ```text
-pytest: 77 passed
+pytest: 85 passed
 ruff: All checks passed
 docker compose config: passed
 docker compose up --build: passed
@@ -1159,6 +1219,9 @@ GET /metrics: passed
 schedule comparison smoke flow: passed
 prometheus target health: up
 grafana dashboard provisioning: passed
+async worker success smoke flow: passed
+async worker retry smoke flow: passed
+execution result idempotency tests: passed
 ```
 
 ## 8. 当前开发状态
@@ -1166,13 +1229,17 @@ grafana dashboard provisioning: passed
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，并验证了重复执行结果的幂等保护。
 ```
 
 尚未完成：
 
 ```text
-Prometheus/Grafana 可视化
+Celery 自动重试策略
+并发执行结果幂等锁
+Worker 心跳和队列积压监控
+任务取消后通知 Worker
+RabbitMQ / Worker 指标接入 Prometheus 和 Grafana
 ```
 
 当前建议下一步：
@@ -1229,11 +1296,18 @@ READY -> DISPATCHED -> RUNNING -> SUCCESS / FAILED
 
 ### 9.3 执行结果幂等
 
-要学习：
+状态：已完成第一版。
+
+已经学到：
 
 - 为什么真实系统会收到重复回调。
 - 如何用 `execution_id` 保证重复结果不重复处理。
 - 成功结果不应被后到达的失败结果覆盖。
+- 重复失败不应该重复消耗 `retry_count`。
+
+后续继续学习：
+
+- 多 Worker 并发回传同一个 execution id 时，如何通过数据库行锁或乐观锁做更强保护。
 
 ### 9.4 指标统计
 
@@ -1296,12 +1370,23 @@ greedy
 
 ### 9.8 RabbitMQ / Celery
 
-要学习：
+状态：已开始，已完成第一版异步执行和失败重试。
+
+已经学到：
 
 - 为什么执行模块不应该永远由 API 进程同步执行。
-- 如何把执行任务放进消息队列。
-- Celery Worker 如何消费任务。
-- 如何处理重试和失败。
+- 如何把 execution id 投递到 RabbitMQ。
+- Celery Worker 如何消费任务并打开自己的数据库 Session。
+- Worker 为什么仍然复用 Service 层，而不是自己写状态推进逻辑。
+- 如何用 `simulation` 模拟成功、失败、超时和取消。
+- 如何处理可重试失败和最终失败。
+
+后续继续学习：
+
+- Celery 自带 retry 机制。
+- 更强的并发幂等处理，例如数据库行锁或乐观锁。
+- 队列积压和 Worker 健康监控。
+- 任务取消和 Worker 正在执行之间的协调。
 
 ### 9.9 MQTT
 
@@ -1409,10 +1494,13 @@ metrics-service
 -> Prometheus 文本指标端点
 -> 调度策略对比
 -> Prometheus/Grafana 可视化
+-> RabbitMQ/Celery 异步执行
+-> Worker 自动回传执行结果
+-> 失败模拟与子任务重试
 ```
 
 下一阶段应继续完成：
 
 ```text
-阶段性整理、提交和 PR
+Celery 重试策略、幂等处理、Worker/队列监控
 ```
