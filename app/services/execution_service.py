@@ -134,6 +134,7 @@ class ExecutionService:
                 details={"execution_id": str(execution_id)},
             )
 
+        # Idempotency guard: duplicate or late results must not advance state twice.
         if record.status != ExecutionStatus.RUNNING:
             return ExecutionResult(
                 execution_id=record.id,
@@ -170,18 +171,26 @@ class ExecutionService:
             ExecutionStatus.TIMEOUT,
             ExecutionStatus.CANCELED,
         }:
-            self._move_subtask_to_terminal(
-                subtask.status,
-                SubtaskStatus.FAILED,
-                subtask.id,
-            )
-            subtask.status = SubtaskStatus.FAILED
-            subtask.finished_at = now
-            subtask.failure_reason = failure_reason
-            self._move_task_to_terminal(task.status, TaskStatus.FAILED, task.id)
-            task.status = TaskStatus.FAILED
-            task.failure_reason = failure_reason
-            task.finished_at = now
+            if self._can_retry_subtask(status, subtask.retry_count, subtask.max_retries):
+                self._move_subtask_to_retry_ready(subtask.status, subtask.id)
+                subtask.status = SubtaskStatus.READY
+                subtask.retry_count += 1
+                subtask.started_at = None
+                subtask.finished_at = None
+                subtask.failure_reason = failure_reason
+            else:
+                self._move_subtask_to_terminal(
+                    subtask.status,
+                    SubtaskStatus.FAILED,
+                    subtask.id,
+                )
+                subtask.status = SubtaskStatus.FAILED
+                subtask.finished_at = now
+                subtask.failure_reason = failure_reason
+                self._move_task_to_terminal(task.status, TaskStatus.FAILED, task.id)
+                task.status = TaskStatus.FAILED
+                task.failure_reason = failure_reason
+                task.finished_at = now
 
         self.db.flush()
         return ExecutionResult(
@@ -241,6 +250,37 @@ class ExecutionService:
                     "target_status": target_status,
                 },
             ) from exc
+
+    @staticmethod
+    def _move_subtask_to_retry_ready(
+        current_status: SubtaskStatus,
+        subtask_id: UUID,
+    ) -> None:
+        try:
+            ensure_transition_allowed(current_status, SubtaskStatus.FAILED)
+            ensure_transition_allowed(SubtaskStatus.FAILED, SubtaskStatus.RETRYING)
+            ensure_transition_allowed(SubtaskStatus.RETRYING, SubtaskStatus.READY)
+        except ValueError as exc:
+            raise AppError(
+                code="SUBTASK_STATE_CONFLICT",
+                message=str(exc),
+                status_code=409,
+                details={
+                    "subtask_id": str(subtask_id),
+                    "current_status": current_status,
+                    "target_status": SubtaskStatus.READY,
+                },
+            ) from exc
+
+    @staticmethod
+    def _can_retry_subtask(
+        status: ExecutionStatus,
+        retry_count: int,
+        max_retries: int,
+    ) -> bool:
+        return status in {ExecutionStatus.FAILED, ExecutionStatus.TIMEOUT} and (
+            retry_count < max_retries
+        )
 
     @staticmethod
     def _move_task_to_terminal(

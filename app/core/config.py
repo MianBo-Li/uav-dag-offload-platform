@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/uav_dag"
     redis_url: str = "redis://localhost:6379/0"
+    celery_broker_url: str = "amqp://guest:guest@localhost:5672//"
+    celery_result_backend: str = "redis://localhost:6379/1"
+    celery_task_default_queue: str = "uav_dag_execution"
+    execution_auto_enqueue_enabled: bool = False
+    simulated_execution_duration_ms: int = 100
+    simulated_execution_sleep_seconds: float = 0.0
     heartbeat_timeout_seconds: int = 30
     default_scheduler_strategy: str = "greedy"
 
