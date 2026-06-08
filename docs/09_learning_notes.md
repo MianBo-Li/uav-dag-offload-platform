@@ -947,7 +947,7 @@ docs/10_docker_compose.md
 - [docs/10_docker_compose.md](10_docker_compose.md)
 - [README.md](../README.md)
 
-当前 Compose 服务：
+该阶段 Compose 服务：
 
 ```text
 api       FastAPI 后端服务
@@ -1146,22 +1146,85 @@ RUNNING -> FAILED -> RETRYING -> READY
 - `execution_records.attempt = subtask.retry_count + 1`，用于记录每一次真实执行尝试。
 - 同一个 `execution_id` 的执行结果只接受一次，重复或迟到结果返回 `accepted=false`，不能再次推进状态。
 - 幂等和重试不同：重试会创建新的 `execution_record`，幂等是在保护同一次执行尝试不要被重复处理。
+- Celery 自动重试和业务重试不同：Celery 重试处理 Worker/数据库临时异常，业务重试处理子任务执行失败。
+- Worker 只对数据库连接中断、连接池超时等临时基础设施异常调用 Celery retry，不对 `AppError` 这类业务错误重试。
 
-当前验证：
+该阶段验证：
 
 ```text
-pytest: 85 passed
+pytest: 91 passed
 ruff --no-cache: All checks passed
 docker compose config: passed
 Docker async success smoke: passed
 Docker async retry smoke: passed
 duplicate execution result idempotency tests: passed
+celery worker retry classification tests: passed
 ```
 
 详细专题说明见：
 
 ```text
 docs/11_async_execution_plan.md
+```
+
+### 6.27 阶段性整理与计划对齐
+
+日期：2026-06-08
+
+目标：
+
+```text
+不继续堆新功能，先整理当前异步执行与重试阶段。
+```
+
+为什么要做：
+
+- 学习型项目不能只追着功能往前跑，否则很容易忘记“为什么这样设计”。
+- 当前工作区已经包含 RabbitMQ / Celery、失败重试、幂等保护、Docker 和监控文档等多类改动，适合先做阶段性收束。
+- `docs/02_learning_roadmap.md` 原来的“当前第一任务”还停留在早期需求分析阶段，需要和真实进度对齐。
+
+涉及内容：
+
+- [02_learning_roadmap.md](02_learning_roadmap.md)
+- [09_learning_notes.md](09_learning_notes.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+- 当前分支：`feature/celery-retry-strategy`
+
+学到的知识：
+
+- 路线图不是写完就不变的文档，它应该随着项目进度校准。
+- 阶段性整理本身也是工程能力：确认范围、验证测试、更新文档、明确下一步。
+- 文档中如果同时存在“已完成”和“暂不实现”的旧描述，会让后续开发判断失真，应及时修正。
+- `ruff` 默认会写 `.ruff_cache`，如果本地缓存目录有权限问题，可以用 `--no-cache` 跑静态检查，避免缓存权限影响验证判断。
+
+本次验证：
+
+```text
+pytest: 91 passed
+ruff --no-cache: All checks passed
+docker compose config --quiet: passed
+```
+
+未在本次重复验证：
+
+```text
+docker compose up --build
+Docker async success smoke
+Docker async retry smoke
+Prometheus / Grafana 页面级验证
+```
+
+当前边界：
+
+- 本次只做阶段整理和文档对齐，没有新增业务代码。
+- `CMDP_project` 和 `CMDP-方案整理.md` 属于另一个学习子项目，本阶段不混入主系统提交范围。
+
+下一步：
+
+```text
+整理当前分支改动
+-> 形成阶段性提交或 PR
+-> 再进入并发幂等、Worker/队列监控、死信队列和告警
 ```
 
 ## 7. 测试学习总结
@@ -1206,11 +1269,11 @@ API 测试：
 
 ### 7.3 当前测试状态
 
-截至 2026-05-31：
+截至 2026-06-08：
 
 ```text
-pytest: 85 passed
-ruff: All checks passed
+pytest: 91 passed
+ruff --no-cache: All checks passed
 docker compose config: passed
 docker compose up --build: passed
 api health check: passed
@@ -1222,6 +1285,7 @@ grafana dashboard provisioning: passed
 async worker success smoke flow: passed
 async worker retry smoke flow: passed
 execution result idempotency tests: passed
+celery worker retry classification tests: passed
 ```
 
 ## 8. 当前开发状态
@@ -1229,17 +1293,17 @@ execution result idempotency tests: passed
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，并验证了重复执行结果的幂等保护。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，并加入了 Worker 临时基础设施异常的 Celery 自动重试策略。
 ```
 
 尚未完成：
 
 ```text
-Celery 自动重试策略
 并发执行结果幂等锁
 Worker 心跳和队列积压监控
 任务取消后通知 Worker
 RabbitMQ / Worker 指标接入 Prometheus 和 Grafana
+死信队列和重试耗尽告警
 ```
 
 当前建议下一步：
@@ -1370,7 +1434,7 @@ greedy
 
 ### 9.8 RabbitMQ / Celery
 
-状态：已开始，已完成第一版异步执行和失败重试。
+状态：已开始，已完成第一版异步执行、失败重试和 Celery 自动重试策略。
 
 已经学到：
 
@@ -1380,13 +1444,16 @@ greedy
 - Worker 为什么仍然复用 Service 层，而不是自己写状态推进逻辑。
 - 如何用 `simulation` 模拟成功、失败、超时和取消。
 - 如何处理可重试失败和最终失败。
+- 如何区分业务重试和 Celery 重试。
+- 哪些异常适合自动重试，哪些业务错误不应该自动重试。
+- 指数退避和最大退避时间的作用。
 
 后续继续学习：
 
-- Celery 自带 retry 机制。
 - 更强的并发幂等处理，例如数据库行锁或乐观锁。
 - 队列积压和 Worker 健康监控。
 - 任务取消和 Worker 正在执行之间的协调。
+- 死信队列和重试耗尽告警。
 
 ### 9.9 MQTT
 
@@ -1497,10 +1564,54 @@ metrics-service
 -> RabbitMQ/Celery 异步执行
 -> Worker 自动回传执行结果
 -> 失败模拟与子任务重试
+-> Celery 自动重试策略
 ```
 
 下一阶段应继续完成：
 
 ```text
-Celery 重试策略、幂等处理、Worker/队列监控
+并发幂等处理、Worker/队列监控、死信队列和告警
+```
+
+## 13. 后续协作与记录约定
+
+这个项目的核心目标是学习，所以后续开发不只追求“把功能写出来”，还要同步记录每个阶段值得掌握的工程知识。
+
+后续每次进入一个新功能前，应先对照：
+
+- [02_learning_roadmap.md](02_learning_roadmap.md)
+- 本文档第 8 节“当前开发状态”
+- 本文档第 9 节“后续学习计划”
+
+确认当前任务属于哪一个阶段，再开始实现。
+
+每次完成重要功能后，都应在本文档追加对应学习记录，至少包括：
+
+```text
+目标：
+为什么要做：
+涉及层次：
+关键实现：
+学到的知识：
+测试覆盖：
+验证结果：
+当前边界：
+下一步：
+```
+
+后续开发节奏约定：
+
+1. 如果当前阶段还有未整理的大量改动，优先整理、测试、提交，再继续堆新功能。
+2. 如果要新增功能，先确认它是否符合当前计划，不直接跳到更复杂的后续能力。
+3. 如果实现跨越 API、Schema、Service、Repository、ORM、Worker、Docker 或监控配置，学习记录要说明这些层是如何协作的。
+4. 如果发现文档计划和代码现状不一致，优先更新文档，让路线图重新对齐真实进度。
+5. 每次验证都要记录“跑了什么测试”以及“还有哪些没有验证”。
+
+当前下一步仍然是：
+
+```text
+阶段性整理当前异步执行与重试成果
+-> 确认测试和文档一致
+-> 提交或 PR
+-> 再进入并发幂等、Worker/队列监控、死信队列和告警
 ```

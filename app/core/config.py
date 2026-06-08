@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     celery_broker_url: str = "amqp://guest:guest@localhost:5672//"
     celery_result_backend: str = "redis://localhost:6379/1"
     celery_task_default_queue: str = "uav_dag_execution"
+    celery_execution_max_retries: int = 3
+    celery_execution_retry_backoff_seconds: int = 5
+    celery_execution_retry_backoff_max_seconds: int = 60
     execution_auto_enqueue_enabled: bool = False
     simulated_execution_duration_ms: int = 100
     simulated_execution_sleep_seconds: float = 0.0
