@@ -18,7 +18,16 @@ class ExecutionRepository:
         return records
 
     def get_by_id(self, execution_id: UUID) -> ExecutionRecord | None:
+        return self.db.scalar(self._get_by_id_statement(execution_id))
+
+    def get_by_id_for_update(self, execution_id: UUID) -> ExecutionRecord | None:
         return self.db.scalar(
+            self._get_by_id_statement(execution_id).with_for_update()
+        )
+
+    @staticmethod
+    def _get_by_id_statement(execution_id: UUID) -> Select[tuple[ExecutionRecord]]:
+        return (
             select(ExecutionRecord)
             .options(
                 selectinload(ExecutionRecord.subtask),

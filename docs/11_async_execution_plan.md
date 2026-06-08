@@ -165,6 +165,7 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - RabbitMQ / Celery 最小异步执行闭环。
 - 失败模拟和业务重试。
 - 执行结果幂等保护。
+- 执行结果回传前对 `execution_records` 使用数据库行锁。
 - Celery Worker 临时基础设施异常自动重试。
 
 当前版本暂不实现：
@@ -172,7 +173,6 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - 超时检测。
 - Worker 心跳。
 - 任务取消后通知 Worker。
-- 多 worker 并发下的幂等锁。
 - RabbitMQ 消息积压指标。
 - 死信队列和重试耗尽告警。
 - outbox pattern。
@@ -181,13 +181,13 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 8. 下一步学习重点
 
-RabbitMQ / Celery 的第一版学习目标已经完成。后续可以继续推进：
+RabbitMQ / Celery 的执行和幂等第一版学习目标已经完成。后续可以继续推进：
 
-1. 多 Worker 并发下的执行结果幂等锁。
-2. Worker 心跳和 RabbitMQ 队列积压监控。
-3. 任务取消和 Worker 正在执行之间的协调。
-4. 死信队列和 Celery 重试耗尽后的告警。
-5. outbox pattern，避免数据库提交成功但消息投递失败。
+1. Worker 心跳和 RabbitMQ 队列积压监控。
+2. 任务取消和 Worker 正在执行之间的协调。
+3. 死信队列和 Celery 重试耗尽后的告警。
+4. outbox pattern，避免数据库提交成功但消息投递失败。
+5. 在 Prometheus / Grafana 中展示 Worker 和队列状态。
 
 ## 9. 失败模拟与重试
 
@@ -348,7 +348,54 @@ ExecutionService.report_result()
 重复成功结果不会覆盖原成功记录
 成功后迟到失败不会覆盖成功状态
 重复失败不会重复消耗 retry_count
+ExecutionRepository.get_by_id_for_update() 在 PostgreSQL 方言下生成 FOR UPDATE
+ExecutionService.report_result() 使用带锁读取入口
 ```
+
+### 10.1 为什么还需要数据库行锁
+
+普通幂等检查解决的是“第二次结果到达时，记录已经不是 `RUNNING`”的情况：
+
+```text
+第一次结果已提交
+-> 第二次结果读取到 SUCCESS / FAILED
+-> accepted=false
+```
+
+但多 Worker 并发时可能出现更危险的时序：
+
+```text
+Worker A 读取 execution_record.status = RUNNING
+Worker B 同时读取 execution_record.status = RUNNING
+Worker A 推进状态并提交
+Worker B 也尝试推进同一条记录
+```
+
+因此当前在 `ExecutionService.report_result()` 中改为通过：
+
+```text
+ExecutionRepository.get_by_id_for_update()
+```
+
+读取执行记录。它在 PostgreSQL 下会生成：
+
+```sql
+SELECT ...
+FROM execution_records
+WHERE execution_records.id = ...
+FOR UPDATE
+```
+
+含义是：
+
+- 同一个 `execution_id` 的结果处理会围绕同一行串行化。
+- 后到的 Worker 必须等先到的事务提交或回滚。
+- 等待结束后，后到 Worker 再读取状态，如果已经不是 `RUNNING`，就返回 `accepted=false`。
+
+测试环境使用 SQLite，SQLite 不真正支持 PostgreSQL 风格的行级锁，所以测试分成两类：
+
+- Repository 测试：用 PostgreSQL 方言编译 SQL，确认会生成 `FOR UPDATE`。
+- Service 测试：确认 `report_result()` 确实调用带锁读取入口。
 
 ## 11. Celery 自动重试策略
 

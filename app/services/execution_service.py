@@ -125,7 +125,7 @@ class ExecutionService:
         output_summary: str | None = None,
         failure_reason: str | None = None,
     ) -> ExecutionResult:
-        record = self.execution_repository.get_by_id(execution_id)
+        record = self.execution_repository.get_by_id_for_update(execution_id)
         if record is None:
             raise AppError(
                 code="EXECUTION_NOT_FOUND",
