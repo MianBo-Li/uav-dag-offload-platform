@@ -160,27 +160,34 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 7. 当前边界
 
+当前版本已经实现：
+
+- RabbitMQ / Celery 最小异步执行闭环。
+- 失败模拟和业务重试。
+- 执行结果幂等保护。
+- Celery Worker 临时基础设施异常自动重试。
+
 当前版本暂不实现：
 
-- Celery 自动重试策略。
 - 超时检测。
 - Worker 心跳。
 - 任务取消后通知 Worker。
 - 多 worker 并发下的幂等锁。
 - RabbitMQ 消息积压指标。
+- 死信队列和重试耗尽告警。
 - outbox pattern。
 
 这些是后续真实化阶段继续学习的内容。
 
 ## 8. 下一步学习重点
 
-后续可以继续推进：
+RabbitMQ / Celery 的第一版学习目标已经完成。后续可以继续推进：
 
-1. Docker Compose 启动 RabbitMQ 和 Worker。
-2. 用 API 创建任务、调度、执行，观察 Worker 自动回传结果。
-3. 给 Worker 增加失败模拟。
-4. 给执行结果增加幂等和重试。
-5. 在 Prometheus/Grafana 中加入队列和 Worker 指标。
+1. 多 Worker 并发下的执行结果幂等锁。
+2. Worker 心跳和 RabbitMQ 队列积压监控。
+3. 任务取消和 Worker 正在执行之间的协调。
+4. 死信队列和 Celery 重试耗尽后的告警。
+5. outbox pattern，避免数据库提交成功但消息投递失败。
 
 ## 9. 失败模拟与重试
 
@@ -342,3 +349,95 @@ ExecutionService.report_result()
 成功后迟到失败不会覆盖成功状态
 重复失败不会重复消耗 retry_count
 ```
+
+## 11. Celery 自动重试策略
+
+前面已经实现了业务重试：
+
+```text
+子任务执行失败
+-> 根据 retry_count / max_retries 判断是否重新变为 READY
+-> 之后由调度器重新生成计划并创建新的 execution_record
+```
+
+Celery 自动重试解决的是另一个问题：
+
+```text
+Worker 本次没有能力完成结果处理
+-> 例如数据库连接临时中断、连接池超时
+-> Celery 稍后重新执行同一条消息
+```
+
+这两类重试必须区分：
+
+```text
+业务重试：任务真的执行失败了，系统要不要再跑一次子任务。
+Celery 重试：Worker/数据库/网络临时故障，本次消息处理没有完成。
+```
+
+当前策略：
+
+```text
+OperationalError -> retry
+SQLAlchemy TimeoutError -> retry
+DBAPIError(connection_invalidated=True) -> retry
+AppError -> no retry
+ValueError -> no retry
+```
+
+不重试 `AppError` 的原因是它通常代表业务语义问题，例如：
+
+```text
+EXECUTION_NOT_FOUND
+EXECUTION_STATE_CONFLICT
+TASK_STATE_CONFLICT
+```
+
+这些错误重复消费消息也不会自然恢复，应该暴露出来，而不是在队列里反复重试。
+
+### 11.1 指数退避
+
+当前使用指数退避：
+
+```text
+第 1 次 retry countdown = 5 秒
+第 2 次 retry countdown = 10 秒
+第 3 次 retry countdown = 20 秒
+最大不超过 60 秒
+```
+
+对应配置：
+
+```text
+CELERY_EXECUTION_MAX_RETRIES=3
+CELERY_EXECUTION_RETRY_BACKOFF_SECONDS=5
+CELERY_EXECUTION_RETRY_BACKOFF_MAX_SECONDS=60
+```
+
+### 11.2 消息确认策略
+
+当前 Celery 配置中开启：
+
+```text
+task_acks_late=True
+task_reject_on_worker_lost=True
+worker_prefetch_multiplier=1
+```
+
+含义：
+
+- `task_acks_late=True`：Worker 完成任务后再确认消息。
+- `task_reject_on_worker_lost=True`：Worker 异常退出时，消息可以重新回到队列。
+- `worker_prefetch_multiplier=1`：每个 Worker 进程一次只预取少量任务，便于观察和控制。
+
+这些设置会增加重复投递的可能性，所以前面做的执行结果幂等非常重要。
+
+### 11.3 当前边界
+
+当前版本还没有实现：
+
+- 死信队列。
+- 重试耗尽后的告警。
+- 重试次数写入业务表。
+- 不同异常类型的不同重试策略。
+- Worker 心跳和队列积压监控。

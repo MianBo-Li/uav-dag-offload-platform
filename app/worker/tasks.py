@@ -1,8 +1,11 @@
 from time import sleep
 from uuid import UUID
 
+from celery import Task
 from celery.utils.log import get_task_logger
+from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as SQLAlchemyTimeoutError
 
+from app.core.errors import AppError
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.domain.enums import ExecutionStatus
@@ -12,8 +15,27 @@ from app.worker.celery_app import celery_app
 logger = get_task_logger(__name__)
 
 
-@celery_app.task(name="app.worker.tasks.execute_subtask")
+def is_retryable_worker_exception(exc: Exception) -> bool:
+    if isinstance(exc, AppError):
+        return False
+    if isinstance(exc, OperationalError | SQLAlchemyTimeoutError):
+        return True
+    if isinstance(exc, DBAPIError):
+        return exc.connection_invalidated
+    return False
+
+
+def calculate_retry_countdown(
+    retry_count: int,
+    base_seconds: int,
+    max_seconds: int,
+) -> int:
+    return min(base_seconds * (2**retry_count), max_seconds)
+
+
+@celery_app.task(name="app.worker.tasks.execute_subtask", bind=True)
 def execute_subtask(
+    self: Task,
     execution_id: str,
     result_status: str = ExecutionStatus.SUCCESS.value,
     duration_ms: int | None = None,
@@ -52,8 +74,26 @@ def execute_subtask(
             "task_status": result.task_status,
             "accepted": result.accepted,
         }
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if is_retryable_worker_exception(exc):
+            retry_countdown = calculate_retry_countdown(
+                self.request.retries,
+                settings.celery_execution_retry_backoff_seconds,
+                settings.celery_execution_retry_backoff_max_seconds,
+            )
+            logger.warning(
+                "Retrying execution task %s after retryable worker error in %s seconds",
+                execution_id,
+                retry_countdown,
+                exc_info=True,
+            )
+            raise self.retry(
+                exc=exc,
+                countdown=retry_countdown,
+                max_retries=settings.celery_execution_max_retries,
+            ) from exc
+
         logger.exception("Failed to execute subtask %s", execution_id)
         raise
     finally:
