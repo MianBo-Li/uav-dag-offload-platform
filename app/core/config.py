@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     celery_execution_max_retries: int = 3
     celery_execution_retry_backoff_seconds: int = 5
     celery_execution_retry_backoff_max_seconds: int = 60
+    rabbitmq_queue_monitoring_enabled: bool = False
+    rabbitmq_management_url: str = "http://localhost:15672/api"
+    rabbitmq_management_username: str = "guest"
+    rabbitmq_management_password: str = "guest"
+    rabbitmq_management_vhost: str = "/"
+    rabbitmq_management_timeout_seconds: float = 1.0
     execution_auto_enqueue_enabled: bool = False
     simulated_execution_duration_ms: int = 100
     simulated_execution_sleep_seconds: float = 0.0

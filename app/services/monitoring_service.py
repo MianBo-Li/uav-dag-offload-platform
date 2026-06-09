@@ -1,12 +1,19 @@
 from app.repositories.monitoring_repository import MonitoringRepository
+from app.services.queue_monitoring_service import RabbitMQQueueMonitoringService
 
 
 class MonitoringService:
-    def __init__(self, repository: MonitoringRepository) -> None:
+    def __init__(
+        self,
+        repository: MonitoringRepository,
+        queue_monitor: RabbitMQQueueMonitoringService | None = None,
+    ) -> None:
         self.repository = repository
+        self.queue_monitor = queue_monitor or RabbitMQQueueMonitoringService()
 
     def render_prometheus_metrics(self) -> str:
         snapshot = self.repository.load_snapshot()
+        queue_snapshot = self.queue_monitor.load_snapshot()
         lines: list[str] = []
 
         _append_gauge(
@@ -96,6 +103,72 @@ class MonitoringService:
             "uav_dag_execution_duration_ms_count",
             "Number of execution records that have duration values.",
             snapshot.execution_duration_count,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_auto_enqueue_enabled",
+            "Whether API requests automatically enqueue execution records to Celery.",
+            int(self.queue_monitor.settings.execution_auto_enqueue_enabled),
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_retry_max_retries",
+            "Configured maximum Celery retries for execution worker tasks.",
+            self.queue_monitor.settings.celery_execution_max_retries,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_retry_backoff_seconds",
+            "Configured base retry backoff for execution worker tasks.",
+            self.queue_monitor.settings.celery_execution_retry_backoff_seconds,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_retry_backoff_max_seconds",
+            "Configured maximum retry backoff for execution worker tasks.",
+            self.queue_monitor.settings.celery_execution_retry_backoff_max_seconds,
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_monitor_enabled",
+            "Whether RabbitMQ queue monitoring is enabled.",
+            "queue",
+            {queue_snapshot.queue_name: int(queue_snapshot.enabled)},
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_monitor_available",
+            "Whether RabbitMQ queue monitoring is currently reachable.",
+            "queue",
+            {queue_snapshot.queue_name: int(queue_snapshot.available)},
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_messages",
+            "Current RabbitMQ messages in the Celery execution queue.",
+            "queue",
+            {queue_snapshot.queue_name: queue_snapshot.messages},
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_messages_ready",
+            "Current RabbitMQ ready messages in the Celery execution queue.",
+            "queue",
+            {queue_snapshot.queue_name: queue_snapshot.messages_ready},
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_messages_unacknowledged",
+            "Current RabbitMQ unacknowledged messages in the Celery execution queue.",
+            "queue",
+            {queue_snapshot.queue_name: queue_snapshot.messages_unacknowledged},
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_queue_consumers",
+            "Current RabbitMQ consumers attached to the Celery execution queue.",
+            "queue",
+            {queue_snapshot.queue_name: queue_snapshot.consumers},
         )
 
         return "\n".join(lines) + "\n"

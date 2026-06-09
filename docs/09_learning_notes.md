@@ -1298,6 +1298,102 @@ Worker 心跳和 RabbitMQ 队列积压监控
 -> 死信队列和重试耗尽告警
 ```
 
+### 6.29 Worker/队列监控指标
+
+日期：2026-06-09
+
+目标：
+
+```text
+把 Celery Worker 相关配置和 RabbitMQ 队列状态接入 /metrics，
+让 Prometheus 和 Grafana 能看到队列积压与消费者数量。
+```
+
+为什么要做：
+
+- 异步执行上线后，单看数据库里的 `RUNNING` 执行记录不够。
+- 如果 RabbitMQ 里堆积了大量 ready 消息，说明 Worker 消费能力不足或 Worker 不在线。
+- 如果 unacknowledged 消息持续升高，说明 Worker 已取走任务但迟迟没有确认。
+- 如果 consumers 为 0，说明队列没有 Worker 正在消费。
+
+涉及文件：
+
+- [app/core/config.py](../app/core/config.py)
+- [app/services/queue_monitoring_service.py](../app/services/queue_monitoring_service.py)
+- [app/services/monitoring_service.py](../app/services/monitoring_service.py)
+- [tests/services/test_queue_monitoring_service.py](../tests/services/test_queue_monitoring_service.py)
+- [tests/api/test_monitoring.py](../tests/api/test_monitoring.py)
+- [docker-compose.yml](../docker-compose.yml)
+- [.env.example](../.env.example)
+- [monitoring/grafana/dashboards/uav-dag-overview.json](../monitoring/grafana/dashboards/uav-dag-overview.json)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+RabbitMQQueueMonitoringService
+-> 读取 RabbitMQ Management API
+-> /api/queues/{vhost}/{queue}
+-> 转换为 Prometheus gauge
+```
+
+新增指标：
+
+```text
+uav_dag_worker_auto_enqueue_enabled
+uav_dag_worker_retry_max_retries
+uav_dag_worker_retry_backoff_seconds
+uav_dag_worker_retry_backoff_max_seconds
+uav_dag_queue_monitor_enabled
+uav_dag_queue_monitor_available
+uav_dag_queue_messages
+uav_dag_queue_messages_ready
+uav_dag_queue_messages_unacknowledged
+uav_dag_queue_consumers
+```
+
+学到的知识：
+
+- 业务指标和基础设施指标都重要，但来源不同。
+- PostgreSQL 适合回答“系统事实是什么”，RabbitMQ Management API 适合回答“队列现在堵不堵”。
+- 本地测试不应该强依赖 RabbitMQ，因此队列监控默认关闭。
+- Docker 环境可以开启队列监控，因为 RabbitMQ Management 插件随 `rabbitmq:3-management` 镜像一起提供。
+- 监控外部依赖时要做降级：RabbitMQ 不可达时，`/metrics` 仍然返回业务指标，并用 `uav_dag_queue_monitor_available=0` 暴露状态。
+- Grafana dashboard 是监控体验的一部分，新增指标后应该尽量补上可视化面板。
+
+测试覆盖：
+
+```text
+API: /metrics 默认暴露 Worker 配置和队列监控占位指标
+Service: 队列监控关闭时返回 disabled snapshot
+Service: RabbitMQ 可达时解析 messages / ready / unacknowledged / consumers
+Service: RabbitMQ 不可达时返回 available=false，不影响 /metrics
+Grafana: dashboard JSON 可解析
+```
+
+验证结果：
+
+```text
+pytest: 96 passed
+ruff --no-cache: All checks passed
+docker compose config --quiet: passed
+Grafana dashboard JSON parse: passed
+```
+
+当前边界：
+
+- 这还不是完整 Worker 心跳，只能从 RabbitMQ consumers 间接判断是否有 Worker 消费。
+- 没有接入 RabbitMQ 官方 exporter，队列指标粒度有限。
+- 没有做 Docker 环境中的真实队列积压冒烟验证。
+
+下一步：
+
+```text
+任务取消和 Worker 执行中的协调
+-> 死信队列和重试耗尽告警
+-> outbox pattern
+```
+
 ## 7. 测试学习总结
 
 ### 7.1 测试分层
@@ -1343,7 +1439,7 @@ API 测试：
 截至 2026-06-08：
 
 ```text
-pytest: 93 passed
+pytest: 96 passed
 ruff --no-cache: All checks passed
 docker compose config: passed
 docker compose up --build: passed
@@ -1358,6 +1454,7 @@ async worker retry smoke flow: passed
 execution result idempotency tests: passed
 celery worker retry classification tests: passed
 execution row lock tests: passed
+queue monitoring metrics tests: passed
 ```
 
 ## 8. 当前开发状态
@@ -1365,15 +1462,14 @@ execution row lock tests: passed
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，并为执行结果回传增加了数据库行锁入口。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，并把 Worker/队列监控指标接入了 Prometheus 和 Grafana。
 ```
 
 尚未完成：
 
 ```text
-Worker 心跳和队列积压监控
 任务取消后通知 Worker
-RabbitMQ / Worker 指标接入 Prometheus 和 Grafana
+Worker 心跳
 死信队列和重试耗尽告警
 ```
 
@@ -1520,10 +1616,12 @@ greedy
 - 如何区分业务重试和 Celery 重试。
 - 哪些异常适合自动重试，哪些业务错误不应该自动重试。
 - 指数退避和最大退避时间的作用。
+- 如何通过 RabbitMQ Management API 读取队列积压和消费者数量。
+- 如何把外部队列状态转换成 Prometheus 指标。
 
 后续继续学习：
 
-- 队列积压和 Worker 健康监控。
+- Worker 主动心跳。
 - 任务取消和 Worker 正在执行之间的协调。
 - 死信队列和重试耗尽告警。
 
@@ -1638,12 +1736,13 @@ metrics-service
 -> 失败模拟与子任务重试
 -> Celery 自动重试策略
 -> 并发执行结果幂等锁
+-> Worker/队列监控指标
 ```
 
 下一阶段应继续完成：
 
 ```text
-Worker/队列监控、任务取消协调、死信队列和告警
+任务取消协调、Worker 心跳、死信队列和告警
 ```
 
 ## 13. 后续协作与记录约定
@@ -1683,6 +1782,6 @@ Worker/队列监控、任务取消协调、死信队列和告警
 当前下一步仍然是：
 
 ```text
-整理并提交当前并发幂等锁成果
--> 再进入 Worker/队列监控、任务取消协调、死信队列和告警
+整理并提交当前 Worker/队列监控成果
+-> 再进入任务取消协调、Worker 心跳、死信队列和告警
 ```

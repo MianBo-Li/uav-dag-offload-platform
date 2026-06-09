@@ -325,6 +325,17 @@ CELERY_EXECUTION_RETRY_BACKOFF_SECONDS=5
 CELERY_EXECUTION_RETRY_BACKOFF_MAX_SECONDS=60
 ```
 
+队列监控配置：
+
+```text
+RABBITMQ_QUEUE_MONITORING_ENABLED=true
+RABBITMQ_MANAGEMENT_URL=http://rabbitmq:15672/api
+RABBITMQ_MANAGEMENT_USERNAME=guest
+RABBITMQ_MANAGEMENT_PASSWORD=guest
+RABBITMQ_MANAGEMENT_VHOST=/
+RABBITMQ_MANAGEMENT_TIMEOUT_SECONDS=1
+```
+
 因此在 Docker 环境里调用：
 
 ```text
@@ -339,6 +350,25 @@ API 会先创建 `execution_records`，提交数据库事务，然后把 executi
 queued_count: 1
 subtask_status: SUCCESS
 task_status: SUCCESS
+```
+
+当前 `/metrics` 会额外暴露 Worker 和队列指标：
+
+```text
+uav_dag_worker_auto_enqueue_enabled
+uav_dag_worker_retry_max_retries
+uav_dag_queue_monitor_available{queue="uav_dag_execution"}
+uav_dag_queue_messages{queue="uav_dag_execution"}
+uav_dag_queue_messages_ready{queue="uav_dag_execution"}
+uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution"}
+uav_dag_queue_consumers{queue="uav_dag_execution"}
+```
+
+Grafana dashboard 已增加：
+
+```text
+Queue Messages
+Queue Consumers
 ```
 
 更详细的学习记录见：
