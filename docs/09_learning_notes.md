@@ -1227,6 +1227,77 @@ Prometheus / Grafana 页面级验证
 -> 再进入并发幂等、Worker/队列监控、死信队列和告警
 ```
 
+### 6.28 并发执行结果幂等锁
+
+日期：2026-06-08
+
+目标：
+
+```text
+让 ExecutionService.report_result() 在处理同一个 execution_id 时先锁定执行记录，
+降低多 Worker 同时回传同一执行结果时重复推进状态的风险。
+```
+
+为什么要做：
+
+- 之前的幂等规则可以处理“重复结果晚到”的情况。
+- 但如果两个 Worker 几乎同时读取同一条 `execution_record`，它们可能都看到 `RUNNING`。
+- 异步系统里只检查状态还不够，还要考虑并发事务之间的读写顺序。
+
+涉及文件：
+
+- [app/repositories/execution_repository.py](../app/repositories/execution_repository.py)
+- [app/services/execution_service.py](../app/services/execution_service.py)
+- [tests/repositories/test_execution_repository.py](../tests/repositories/test_execution_repository.py)
+- [tests/services/test_execution_service.py](../tests/services/test_execution_service.py)
+- [docs/11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+ExecutionRepository.get_by_id_for_update()
+-> select(ExecutionRecord).where(...).with_for_update()
+-> ExecutionService.report_result() 使用带锁读取
+```
+
+学到的知识：
+
+- 普通幂等和并发安全不是一回事。
+- `accepted=false` 解决的是重复结果再次到达时“不重复推进”。
+- `SELECT ... FOR UPDATE` 解决的是多个事务同时处理同一行业务事实时的串行化问题。
+- SQLite 测试环境不会真正表现 PostgreSQL 行锁，所以测试要验证“锁意图”和“Service 调用路径”，而不是伪造不可靠的线程竞态。
+- Repository 层可以封装不同查询意图：普通读取用 `get_by_id()`，状态推进前读取用 `get_by_id_for_update()`。
+
+测试覆盖：
+
+```text
+Repository: get_by_id_for_update() 在 PostgreSQL 方言下编译出 FOR UPDATE
+Service: report_result() 使用 get_by_id_for_update() 读取 execution_record
+API: 原有重复成功、迟到失败、重复失败测试继续通过
+```
+
+验证结果：
+
+```text
+pytest: 93 passed
+ruff --no-cache: All checks passed
+docker compose config --quiet: passed
+```
+
+当前边界：
+
+- 本地 SQLite 测试不能真实验证行锁阻塞行为。
+- 更强的端到端并发验证应在 PostgreSQL 集成测试或 Docker 环境中补充。
+- 目前只锁定 `execution_records` 行，任务取消、节点离线和重调度的并发协调仍未实现。
+
+下一步：
+
+```text
+Worker 心跳和 RabbitMQ 队列积压监控
+-> 任务取消和 Worker 执行中的协调
+-> 死信队列和重试耗尽告警
+```
+
 ## 7. 测试学习总结
 
 ### 7.1 测试分层
@@ -1272,7 +1343,7 @@ API 测试：
 截至 2026-06-08：
 
 ```text
-pytest: 91 passed
+pytest: 93 passed
 ruff --no-cache: All checks passed
 docker compose config: passed
 docker compose up --build: passed
@@ -1286,6 +1357,7 @@ async worker success smoke flow: passed
 async worker retry smoke flow: passed
 execution result idempotency tests: passed
 celery worker retry classification tests: passed
+execution row lock tests: passed
 ```
 
 ## 8. 当前开发状态
@@ -1293,13 +1365,12 @@ celery worker retry classification tests: passed
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，并加入了 Worker 临时基础设施异常的 Celery 自动重试策略。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，并为执行结果回传增加了数据库行锁入口。
 ```
 
 尚未完成：
 
 ```text
-并发执行结果幂等锁
 Worker 心跳和队列积压监控
 任务取消后通知 Worker
 RabbitMQ / Worker 指标接入 Prometheus 和 Grafana
@@ -1360,7 +1431,7 @@ READY -> DISPATCHED -> RUNNING -> SUCCESS / FAILED
 
 ### 9.3 执行结果幂等
 
-状态：已完成第一版。
+状态：已完成第二版，已加入执行记录行锁。
 
 已经学到：
 
@@ -1368,10 +1439,12 @@ READY -> DISPATCHED -> RUNNING -> SUCCESS / FAILED
 - 如何用 `execution_id` 保证重复结果不重复处理。
 - 成功结果不应被后到达的失败结果覆盖。
 - 重复失败不应该重复消耗 `retry_count`。
+- 为什么普通幂等不等于并发安全。
+- 如何用 `SELECT ... FOR UPDATE` 让同一条执行记录的结果处理串行化。
 
 后续继续学习：
 
-- 多 Worker 并发回传同一个 execution id 时，如何通过数据库行锁或乐观锁做更强保护。
+- 在真实 PostgreSQL 集成环境中验证多 Worker 并发阻塞行为。
 
 ### 9.4 指标统计
 
@@ -1450,7 +1523,6 @@ greedy
 
 后续继续学习：
 
-- 更强的并发幂等处理，例如数据库行锁或乐观锁。
 - 队列积压和 Worker 健康监控。
 - 任务取消和 Worker 正在执行之间的协调。
 - 死信队列和重试耗尽告警。
@@ -1565,12 +1637,13 @@ metrics-service
 -> Worker 自动回传执行结果
 -> 失败模拟与子任务重试
 -> Celery 自动重试策略
+-> 并发执行结果幂等锁
 ```
 
 下一阶段应继续完成：
 
 ```text
-并发幂等处理、Worker/队列监控、死信队列和告警
+Worker/队列监控、任务取消协调、死信队列和告警
 ```
 
 ## 13. 后续协作与记录约定
@@ -1610,8 +1683,6 @@ metrics-service
 当前下一步仍然是：
 
 ```text
-阶段性整理当前异步执行与重试成果
--> 确认测试和文档一致
--> 提交或 PR
--> 再进入并发幂等、Worker/队列监控、死信队列和告警
+整理并提交当前并发幂等锁成果
+-> 再进入 Worker/队列监控、任务取消协调、死信队列和告警
 ```
