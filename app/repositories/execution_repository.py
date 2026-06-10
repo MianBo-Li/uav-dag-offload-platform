@@ -66,6 +66,18 @@ class ExecutionRepository:
         )
         return items, total
 
+    def list_running_by_task_for_update(self, task_id: UUID) -> list[ExecutionRecord]:
+        return list(
+            self.db.scalars(
+                select(ExecutionRecord)
+                .where(
+                    ExecutionRecord.task_id == task_id,
+                    ExecutionRecord.status == ExecutionStatus.RUNNING,
+                )
+                .with_for_update()
+            )
+        )
+
     def list_all_by_task(self, task_id: UUID) -> list[ExecutionRecord]:
         return list(
             self.db.scalars(

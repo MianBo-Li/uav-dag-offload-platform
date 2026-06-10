@@ -1,6 +1,6 @@
 import pytest
 
-from app.domain.enums import TaskStatus
+from app.domain.enums import SubtaskStatus, TaskStatus
 from app.domain.state_machine import can_transition, ensure_transition_allowed
 
 
@@ -16,3 +16,7 @@ def test_ensure_transition_allowed_rejects_invalid_task_transition() -> None:
 def test_canceled_task_cannot_be_scheduled_or_run() -> None:
     assert not can_transition(TaskStatus.CANCELED, TaskStatus.SCHEDULED)
     assert not can_transition(TaskStatus.CANCELED, TaskStatus.RUNNING)
+
+
+def test_running_subtask_can_be_canceled() -> None:
+    assert can_transition(SubtaskStatus.RUNNING, SubtaskStatus.CANCELED)

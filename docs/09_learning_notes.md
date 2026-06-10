@@ -1288,14 +1288,14 @@ docker compose config --quiet: passed
 
 - 本地 SQLite 测试不能真实验证行锁阻塞行为。
 - 更强的端到端并发验证应在 PostgreSQL 集成测试或 Docker 环境中补充。
-- 目前只锁定 `execution_records` 行，任务取消、节点离线和重调度的并发协调仍未实现。
+- 本阶段只锁定 `execution_records` 行；任务取消协调已在 6.30 补上第一版，节点离线和重调度的并发协调仍未实现。
 
 下一步：
 
 ```text
 Worker 心跳和 RabbitMQ 队列积压监控
--> 任务取消和 Worker 执行中的协调
--> 死信队列和重试耗尽告警
+-> 任务取消与 Worker 执行协调
+-> Worker 心跳、死信队列和重试耗尽告警
 ```
 
 ### 6.29 Worker/队列监控指标
@@ -1389,7 +1389,8 @@ Grafana dashboard JSON parse: passed
 下一步：
 
 ```text
-任务取消和 Worker 执行中的协调
+任务取消与 Worker 执行协调
+-> Worker 心跳
 -> 死信队列和重试耗尽告警
 -> outbox pattern
 ```
@@ -1457,20 +1458,109 @@ execution row lock tests: passed
 queue monitoring metrics tests: passed
 ```
 
+### 6.30 任务取消与 Worker 执行协调
+
+日期：2026-06-10
+
+目标：
+
+```text
+当用户取消正在执行的任务时，
+系统不仅要取消总任务，
+还要取消非终态子任务和正在运行的 execution_record，
+并让 Worker 的迟到结果回传变成 accepted=false。
+```
+
+为什么要做：
+
+- 异步 Worker 拿到 `execution_id` 后，用户仍然可能取消任务。
+- 如果只把 `dag_tasks.status` 改成 `CANCELED`，Worker 后续回传 `SUCCESS` 仍可能尝试推进子任务状态。
+- 真实系统里“迟到回调”是常态，不是异常，必须让状态机能安全拒绝它。
+
+涉及文件：
+
+- [app/domain/enums.py](../app/domain/enums.py)
+- [app/domain/state_machine.py](../app/domain/state_machine.py)
+- [app/repositories/execution_repository.py](../app/repositories/execution_repository.py)
+- [app/services/task_service.py](../app/services/task_service.py)
+- [alembic/versions/20260610_0006_add_canceled_subtask_status.py](../alembic/versions/20260610_0006_add_canceled_subtask_status.py)
+- [tests/api/test_tasks.py](../tests/api/test_tasks.py)
+- [tests/domain/test_state_machine.py](../tests/domain/test_state_machine.py)
+- [02_learning_roadmap.md](02_learning_roadmap.md)
+- [07_state_machine_design.md](07_state_machine_design.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+TaskService.cancel_task()
+-> task.status = CANCELED
+-> 先锁定并取消 RUNNING execution_record
+-> 重新读取子任务状态
+-> 非终态 subtask.status = CANCELED
+-> Worker 迟到回传时，ExecutionService 发现 execution_record 已不是 RUNNING
+-> 返回 accepted=false，不再覆盖已取消状态
+```
+
+学到的知识：
+
+- 取消任务不是一个字段更新，而是跨 `task`、`subtask`、`execution_record` 的一致性问题。
+- 子任务需要自己的 `CANCELED` 终态，否则调度器很难判断哪些子任务已经不应继续执行。
+- 代码枚举加了新状态后，还要同步更新数据库 check constraint，否则真实 PostgreSQL 会拒绝写入。
+- 执行记录是 Worker 回传结果的幂等边界，取消运行中执行记录可以阻止迟到结果再次推进状态。
+- 异步系统要把“迟到结果”当作正常时序处理，而不是只靠报错。
+- 行锁和状态机校验可以组合使用：先锁定事实，再判断当前状态是否仍允许推进。
+
+测试覆盖：
+
+```text
+Domain: RUNNING 子任务允许迁移到 CANCELED
+API: 取消待执行任务时，所有非终态子任务进入 CANCELED
+API: 取消运行中任务时，运行中的 execution_record 进入 CANCELED
+API: 取消后 Worker 迟到 SUCCESS 回传返回 accepted=false
+API: 迟到结果不会写入 duration_ms 或 output_summary
+```
+
+验证结果：
+
+```text
+pytest: 98 passed
+ruff --no-cache: All checks passed
+docker compose config --quiet: passed
+alembic heads: 20260610_0006 (head)
+```
+
+当前边界：
+
+- 当前实现是数据库事实层面的取消协调，还没有主动撤销正在执行的 Celery Worker 任务。
+- 系统还没有存储 Celery task id，因此不能精准调用 revoke。
+- Worker 也还没有周期性检查执行记录是否已取消。
+- 尚未实现 Worker 心跳、死信队列和重试耗尽告警。
+
+下一步：
+
+```text
+Worker 心跳
+-> 主动撤销正在执行的 Worker 任务
+-> 死信队列和重试耗尽告警
+-> outbox pattern
+```
+
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，并把 Worker/队列监控指标接入了 Prometheus 和 Grafana。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，并完成了任务取消与 Worker 迟到结果的第一版协调。
 ```
 
 尚未完成：
 
 ```text
-任务取消后通知 Worker
+主动撤销正在执行的 Celery Worker 任务
 Worker 心跳
 死信队列和重试耗尽告警
+outbox pattern
 ```
 
 当前建议下一步：
@@ -1479,7 +1569,7 @@ Worker 心跳
 阶段性整理、提交和 PR
 ```
 
-也就是把这一阶段的大量学习开发成果整理成一次阶段性提交，而不是继续堆更多未提交改动。
+也就是把这次任务取消协调成果整理成一次阶段性提交，而不是继续堆更多未提交改动。
 
 ## 9. 后续学习计划
 
@@ -1603,7 +1693,7 @@ greedy
 
 ### 9.8 RabbitMQ / Celery
 
-状态：已开始，已完成第一版异步执行、失败重试和 Celery 自动重试策略。
+状态：已开始，已完成第一版异步执行、失败重试、Celery 自动重试策略、队列监控和任务取消协调。
 
 已经学到：
 
@@ -1618,11 +1708,13 @@ greedy
 - 指数退避和最大退避时间的作用。
 - 如何通过 RabbitMQ Management API 读取队列积压和消费者数量。
 - 如何把外部队列状态转换成 Prometheus 指标。
+- 为什么任务取消要同时协调总任务、子任务和执行记录。
+- 为什么 Worker 迟到结果应该返回 `accepted=false`，而不是覆盖已取消状态。
 
 后续继续学习：
 
 - Worker 主动心跳。
-- 任务取消和 Worker 正在执行之间的协调。
+- 主动撤销正在执行的 Celery Worker 任务。
 - 死信队列和重试耗尽告警。
 
 ### 9.9 MQTT
@@ -1737,12 +1829,13 @@ metrics-service
 -> Celery 自动重试策略
 -> 并发执行结果幂等锁
 -> Worker/队列监控指标
+-> 任务取消与 Worker 执行协调
 ```
 
 下一阶段应继续完成：
 
 ```text
-任务取消协调、Worker 心跳、死信队列和告警
+Worker 心跳、主动撤销 Worker 任务、死信队列和告警
 ```
 
 ## 13. 后续协作与记录约定
@@ -1782,6 +1875,6 @@ metrics-service
 当前下一步仍然是：
 
 ```text
-整理并提交当前 Worker/队列监控成果
--> 再进入任务取消协调、Worker 心跳、死信队列和告警
+整理并提交当前任务取消协调成果
+-> 再进入 Worker 心跳、主动撤销 Worker 任务、死信队列和告警
 ```

@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -5,8 +6,9 @@ from sqlalchemy.orm import Session
 from app.core.errors import AppError
 from app.db.models.task import DagDependency, DagSubtask, DagTask
 from app.domain.dag import validate_dag
-from app.domain.enums import SubtaskStatus, TaskStatus
+from app.domain.enums import ExecutionStatus, SubtaskStatus, TaskStatus
 from app.domain.state_machine import ensure_transition_allowed
+from app.repositories.execution_repository import ExecutionRepository
 from app.repositories.task_repository import TaskRepository
 from app.schemas.task import DagTaskCancelRequest, DagTaskCreate
 
@@ -15,6 +17,7 @@ class TaskService:
     def __init__(self, db: Session) -> None:
         self.db = db
         self.repository = TaskRepository(db)
+        self.execution_repository = ExecutionRepository(db)
 
     def create_task(self, data: DagTaskCreate) -> DagTask:
         subtask_ids = [subtask.external_id for subtask in data.subtasks]
@@ -120,8 +123,47 @@ class TaskService:
                 },
             ) from exc
 
+        now = datetime.now(UTC)
+        reason = data.reason
+
         task.status = TaskStatus.CANCELED
-        task.failure_reason = data.reason
+        task.failure_reason = reason
+        task.finished_at = task.finished_at or now
+        # Serialize with in-flight worker callbacks before changing subtask facts.
+        self._cancel_running_executions(task.id, reason, now)
+        self.db.expire(task, ["subtasks"])
+        self._cancel_non_terminal_subtasks(task, reason, now)
         self.db.flush()
         self.db.refresh(task)
         return task
+
+    def _cancel_running_executions(
+        self,
+        task_id: UUID,
+        reason: str | None,
+        canceled_at: datetime,
+    ) -> None:
+        for record in self.execution_repository.list_running_by_task_for_update(task_id):
+            ensure_transition_allowed(record.status, ExecutionStatus.CANCELED)
+            record.status = ExecutionStatus.CANCELED
+            record.finished_at = canceled_at
+            record.failure_reason = reason
+
+    @staticmethod
+    def _cancel_non_terminal_subtasks(
+        task: DagTask,
+        reason: str | None,
+        canceled_at: datetime,
+    ) -> None:
+        terminal_statuses = {
+            SubtaskStatus.SUCCESS,
+            SubtaskStatus.FAILED,
+            SubtaskStatus.CANCELED,
+        }
+        for subtask in task.subtasks:
+            if subtask.status in terminal_statuses:
+                continue
+            ensure_transition_allowed(subtask.status, SubtaskStatus.CANCELED)
+            subtask.status = SubtaskStatus.CANCELED
+            subtask.finished_at = canceled_at
+            subtask.failure_reason = reason

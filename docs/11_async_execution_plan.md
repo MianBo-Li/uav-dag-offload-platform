@@ -168,12 +168,14 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - 执行结果回传前对 `execution_records` 使用数据库行锁。
 - Celery Worker 临时基础设施异常自动重试。
 - RabbitMQ 队列监控指标。
+- 任务取消时同步取消非终态子任务和运行中的执行记录。
+- Worker 迟到结果回传时返回 `accepted=false`，不覆盖已取消事实。
 
 当前版本暂不实现：
 
 - 超时检测。
 - Worker 心跳。
-- 任务取消后通知 Worker。
+- 主动撤销正在执行的 Celery Worker 任务。
 - 死信队列和重试耗尽告警。
 - outbox pattern。
 
@@ -181,10 +183,10 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 8. 下一步学习重点
 
-RabbitMQ / Celery 的执行、幂等和队列监控第一版学习目标已经完成。后续可以继续推进：
+RabbitMQ / Celery 的执行、幂等、队列监控和取消协调第一版学习目标已经完成。后续可以继续推进：
 
 1. Worker 心跳。
-2. 任务取消和 Worker 正在执行之间的协调。
+2. 主动撤销正在执行的 Celery Worker 任务。
 3. 死信队列和 Celery 重试耗尽后的告警。
 4. outbox pattern，避免数据库提交成功但消息投递失败。
 
@@ -556,3 +558,42 @@ Queue Consumers
 - 这不是完整 Worker 心跳，只是 RabbitMQ 队列和消费者视角。
 - 还没有记录 Worker 自身最后心跳时间。
 - 没有接入 RabbitMQ 官方 exporter，因此指标粒度仍然较粗。
+
+## 13. 任务取消与 Worker 迟到结果
+
+异步执行引入后，取消任务会遇到一个典型竞态：
+
+```text
+用户取消任务
+-> 数据库把 task 标记为 CANCELED
+-> Worker 仍然可能已经拿到 execution_id 并继续回传 SUCCESS
+```
+
+如果只取消总任务，不处理子任务和执行记录，迟到的 Worker 结果可能再次推动状态，造成“用户已经取消，但子任务又成功”的矛盾。
+
+当前版本采用数据库事实优先的做法：
+
+```text
+cancel task
+-> task.status = CANCELED
+-> 先锁定并取消 RUNNING execution_record
+-> 重新读取子任务状态
+-> 非终态 subtask.status = CANCELED
+-> late result callback sees execution_record is not RUNNING
+-> accepted = false
+```
+
+这说明异步系统里的取消至少要协调三类事实：
+
+- `dag_tasks`：用户看到的总体任务状态。
+- `subtasks`：调度器后续是否还能继续调度。
+- `execution_records`：Worker 回传结果是否还能被接受。
+
+当前版本仍然没有主动撤销正在执行的 Celery 任务。也就是说，Worker 进程可能仍然完成自己的模拟执行，只是数据库会拒绝它的迟到结果。
+
+后续如果要更接近真实系统，可以继续学习：
+
+- 存储 Celery task id。
+- 调用 Celery revoke 或自定义取消消息。
+- Worker 定期检查执行记录是否已取消。
+- 结合 Worker 心跳判断正在执行的任务是否失联。
