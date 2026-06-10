@@ -167,13 +167,13 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - 执行结果幂等保护。
 - 执行结果回传前对 `execution_records` 使用数据库行锁。
 - Celery Worker 临时基础设施异常自动重试。
+- RabbitMQ 队列监控指标。
 
 当前版本暂不实现：
 
 - 超时检测。
 - Worker 心跳。
 - 任务取消后通知 Worker。
-- RabbitMQ 消息积压指标。
 - 死信队列和重试耗尽告警。
 - outbox pattern。
 
@@ -181,13 +181,12 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 8. 下一步学习重点
 
-RabbitMQ / Celery 的执行和幂等第一版学习目标已经完成。后续可以继续推进：
+RabbitMQ / Celery 的执行、幂等和队列监控第一版学习目标已经完成。后续可以继续推进：
 
-1. Worker 心跳和 RabbitMQ 队列积压监控。
+1. Worker 心跳。
 2. 任务取消和 Worker 正在执行之间的协调。
 3. 死信队列和 Celery 重试耗尽后的告警。
 4. outbox pattern，避免数据库提交成功但消息投递失败。
-5. 在 Prometheus / Grafana 中展示 Worker 和队列状态。
 
 ## 9. 失败模拟与重试
 
@@ -487,4 +486,73 @@ worker_prefetch_multiplier=1
 - 重试耗尽后的告警。
 - 重试次数写入业务表。
 - 不同异常类型的不同重试策略。
-- Worker 心跳和队列积压监控。
+- Worker 心跳。
+
+## 12. Worker/队列监控
+
+当前系统已经把 RabbitMQ 队列状态接入 `/metrics`。
+
+配置项：
+
+```text
+RABBITMQ_QUEUE_MONITORING_ENABLED
+RABBITMQ_MANAGEMENT_URL
+RABBITMQ_MANAGEMENT_USERNAME
+RABBITMQ_MANAGEMENT_PASSWORD
+RABBITMQ_MANAGEMENT_VHOST
+RABBITMQ_MANAGEMENT_TIMEOUT_SECONDS
+```
+
+本地默认关闭：
+
+```text
+RABBITMQ_QUEUE_MONITORING_ENABLED=false
+```
+
+Docker 环境开启：
+
+```text
+RABBITMQ_QUEUE_MONITORING_ENABLED=true
+RABBITMQ_MANAGEMENT_URL=http://rabbitmq:15672/api
+```
+
+这样做的原因是：
+
+- 本地单元测试和 API 测试不应该强依赖 RabbitMQ。
+- Docker 环境中 RabbitMQ Management API 可用，可以读取真实队列状态。
+- RabbitMQ 不可达时，`/metrics` 仍然应该返回业务指标，而不是让 Prometheus 抓取失败。
+
+当前新增指标：
+
+```text
+uav_dag_worker_auto_enqueue_enabled
+uav_dag_worker_retry_max_retries
+uav_dag_worker_retry_backoff_seconds
+uav_dag_worker_retry_backoff_max_seconds
+uav_dag_queue_monitor_enabled{queue="uav_dag_execution"}
+uav_dag_queue_monitor_available{queue="uav_dag_execution"}
+uav_dag_queue_messages{queue="uav_dag_execution"}
+uav_dag_queue_messages_ready{queue="uav_dag_execution"}
+uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution"}
+uav_dag_queue_consumers{queue="uav_dag_execution"}
+```
+
+指标含义：
+
+- `messages`：队列中总消息数。
+- `messages_ready`：等待 Worker 消费的消息数。
+- `messages_unacknowledged`：已被 Worker 取走但尚未确认的消息数。
+- `consumers`：当前连接到队列的消费者数量，通常可以用来判断 Worker 是否在线消费。
+
+Grafana dashboard 已增加：
+
+```text
+Queue Messages
+Queue Consumers
+```
+
+当前边界：
+
+- 这不是完整 Worker 心跳，只是 RabbitMQ 队列和消费者视角。
+- 还没有记录 Worker 自身最后心跳时间。
+- 没有接入 RabbitMQ 官方 exporter，因此指标粒度仍然较粗。

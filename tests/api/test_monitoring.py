@@ -57,6 +57,14 @@ def test_prometheus_metrics_empty_database(client: TestClient) -> None:
     assert "uav_dag_executions_total 0" in body
     assert "uav_dag_execution_duration_ms_sum 0" in body
     assert "uav_dag_execution_duration_ms_count 0" in body
+    assert "uav_dag_worker_auto_enqueue_enabled 0" in body
+    assert "uav_dag_worker_retry_max_retries 3" in body
+    assert 'uav_dag_queue_monitor_enabled{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_monitor_available{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_messages{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_messages_ready{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_consumers{queue="uav_dag_execution"} 0' in body
 
 
 def test_prometheus_metrics_after_execution(client: TestClient) -> None:
