@@ -239,7 +239,78 @@ def test_cancel_task_marks_pending_task_canceled(client: TestClient) -> None:
     assert body["updated_at"] is not None
 
     detail_response = client.get(f"/api/v1/tasks/{task_id}")
-    assert detail_response.json()["status"] == "CANCELED"
+    detail_body = detail_response.json()
+    assert detail_body["status"] == "CANCELED"
+    assert {
+        subtask["external_id"]: subtask["status"]
+        for subtask in detail_body["subtasks"]
+    } == {
+        "capture_image": "CANCELED",
+        "detect_target": "CANCELED",
+        "upload_report": "CANCELED",
+    }
+
+
+def test_cancel_running_task_cancels_running_execution_and_ignores_late_result(
+    client: TestClient,
+) -> None:
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+    execute_response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+    execution_id = execute_response.json()["execution_ids"][0]
+
+    cancel_response = client.post(
+        f"/api/v1/tasks/{task_id}/cancel",
+        json={"reason": "operator canceled during execution"},
+    )
+
+    assert cancel_response.status_code == 200
+    assert cancel_response.json()["status"] == "CANCELED"
+
+    detail_response = client.get(f"/api/v1/tasks/{task_id}")
+    detail_body = detail_response.json()
+    assert detail_body["status"] == "CANCELED"
+    capture_subtask = next(
+        subtask
+        for subtask in detail_body["subtasks"]
+        if subtask["external_id"] == "capture_image"
+    )
+    assert capture_subtask["status"] == "CANCELED"
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["id"] == execution_id
+    assert execution["status"] == "CANCELED"
+    assert execution["failure_reason"] == "operator canceled during execution"
+
+    late_result_response = client.post(
+        f"/api/v1/executions/{execution_id}/result",
+        json={
+            "status": "SUCCESS",
+            "duration_ms": 100,
+            "output_summary": "late worker success should be ignored",
+        },
+    )
+
+    assert late_result_response.status_code == 200
+    late_result_body = late_result_response.json()
+    assert late_result_body["accepted"] is False
+    assert late_result_body["subtask_status"] == "CANCELED"
+    assert late_result_body["task_status"] == "CANCELED"
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["status"] == "CANCELED"
+    assert execution["duration_ms"] is None
+    assert execution["output_summary"] is None
 
 
 def test_cancel_task_rejects_already_canceled_task(client: TestClient) -> None:

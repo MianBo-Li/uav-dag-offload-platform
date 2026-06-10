@@ -29,6 +29,7 @@ class SubtaskStatus(StrEnum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     RETRYING = "RETRYING"
+    CANCELED = "CANCELED"
 
 
 class SubtaskExecutionConstraint(StrEnum):

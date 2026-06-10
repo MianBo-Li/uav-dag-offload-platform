@@ -165,6 +165,7 @@ stateDiagram-v2
 | `SUCCESS` | 执行成功 |
 | `FAILED` | 执行失败 |
 | `RETRYING` | 失败后等待重试 |
+| `CANCELED` | 子任务被取消 |
 
 ### 6.2 状态图
 
@@ -180,6 +181,11 @@ stateDiagram-v2
     RUNNING --> FAILED: timeout
     FAILED --> RETRYING: retry allowed
     RETRYING --> READY: retry scheduled
+    WAITING --> CANCELED: task canceled
+    READY --> CANCELED: task canceled
+    DISPATCHED --> CANCELED: task canceled
+    RUNNING --> CANCELED: task canceled
+    RETRYING --> CANCELED: task canceled
 ```
 
 ### 6.3 状态迁移表
@@ -196,7 +202,14 @@ stateDiagram-v2
 | `RUNNING` | `FAILED` | 超时 | 是 |
 | `FAILED` | `RETRYING` | 可重试 | 是 |
 | `RETRYING` | `READY` | 重试计划生效 | 是 |
+| `WAITING` | `CANCELED` | 任务取消 | 是 |
+| `READY` | `CANCELED` | 任务取消 | 是 |
+| `DISPATCHED` | `CANCELED` | 任务取消 | 是 |
+| `RUNNING` | `CANCELED` | 任务取消 | 是 |
+| `RETRYING` | `CANCELED` | 任务取消 | 是 |
 | `SUCCESS` | 其他 | 普通流程 | 否 |
+| `FAILED` | 其他 | 普通流程 | 否 |
+| `CANCELED` | 其他 | 普通流程 | 否 |
 
 ### 6.4 子任务状态说明
 
@@ -228,16 +241,23 @@ stateDiagram-v2
 
 表示子任务进入重试等待阶段，尚未重新回到 `READY`。
 
+#### `CANCELED`
+
+表示总任务已经被用户或系统取消，这个子任务不应再被调度、执行或由迟到结果覆盖。
+
 ### 6.5 子任务取消问题
 
-第一阶段子任务状态枚举中没有 `CANCELED`，所以取消任务时的处理方式是：
+当前版本已经为子任务增加 `CANCELED`，所以取消任务时的处理方式是：
 
 - 任务整体进入 `CANCELED`。
+- 非终态子任务进入 `CANCELED`。
+- 正在运行的执行记录进入 `CANCELED`。
 - 后续不再调度新的子任务。
-- 已经运行中的执行尝试按实际结果收尾，或者在实现上标记为失败/超时结束。
-- 不新增子任务取消状态，避免状态体系膨胀。
+- Worker 或节点迟到回传时，如果执行记录已经不是 `RUNNING`，结果不再被接受。
 
-这是一个有意的简化，后续如果需要更细的取消语义，可以再扩展状态枚举。
+这样做的原因是：取消任务不是只改总任务字段，还要阻止子任务和执行记录继续被异步回调推进。
+
+已经进入 `SUCCESS` 或 `FAILED` 的子任务保留原事实，不再强行覆盖为取消。
 
 ## 7. 节点状态机
 
@@ -460,6 +480,7 @@ transition(entity, target_state, event, actor) -> entity
 5. Worker 开始执行后进入 `RUNNING`。
 6. 成功回传后进入 `SUCCESS`。
 7. 失败且可重试后进入 `RETRYING`。
+8. 任务取消后，非终态子任务进入 `CANCELED`。
 
 ### 13.3 节点状态测试
 
