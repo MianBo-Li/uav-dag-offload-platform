@@ -213,6 +213,7 @@ class ExecutionRecord(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     output_summary: Mapped[str | None] = mapped_column(Text)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    celery_task_id: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

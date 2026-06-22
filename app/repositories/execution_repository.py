@@ -20,6 +20,9 @@ class ExecutionRepository:
     def get_by_id(self, execution_id: UUID) -> ExecutionRecord | None:
         return self.db.scalar(self._get_by_id_statement(execution_id))
 
+    def get_plain_by_id(self, execution_id: UUID) -> ExecutionRecord | None:
+        return self.db.get(ExecutionRecord, execution_id)
+
     def get_by_id_for_update(self, execution_id: UUID) -> ExecutionRecord | None:
         return self.db.scalar(
             self._get_by_id_statement(execution_id).with_for_update()
@@ -86,6 +89,11 @@ class ExecutionRepository:
                 .order_by(ExecutionRecord.created_at.asc())
             )
         )
+
+    def set_celery_task_id(self, execution_id: UUID, celery_task_id: str) -> None:
+        record = self.get_plain_by_id(execution_id)
+        if record is not None:
+            record.celery_task_id = celery_task_id
 
     def count_by_node_type(self, task_id: UUID) -> dict[NodeType, int]:
         rows = self.db.execute(

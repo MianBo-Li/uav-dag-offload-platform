@@ -1,8 +1,15 @@
 from collections.abc import Iterable
+from dataclasses import dataclass
 from uuid import UUID
 
 from app.core.config import get_settings
 from app.domain.enums import ExecutionStatus
+
+
+@dataclass(frozen=True)
+class ExecutionDispatchResult:
+    execution_id: UUID
+    celery_task_id: str
 
 
 class ExecutionDispatcher:
@@ -21,19 +28,26 @@ class ExecutionDispatcher:
         duration_ms: int | None = None,
         output_summary: str | None = None,
         failure_reason: str | None = None,
-    ) -> int:
+    ) -> list[ExecutionDispatchResult]:
         execution_id_list = list(execution_ids)
         if not self.auto_enqueue_enabled:
-            return 0
+            return []
 
         from app.worker.tasks import execute_subtask
 
+        dispatch_results: list[ExecutionDispatchResult] = []
         for execution_id in execution_id_list:
-            execute_subtask.delay(
+            async_result = execute_subtask.delay(
                 str(execution_id),
                 result_status=result_status,
                 duration_ms=duration_ms,
                 output_summary=output_summary,
                 failure_reason=failure_reason,
             )
-        return len(execution_id_list)
+            dispatch_results.append(
+                ExecutionDispatchResult(
+                    execution_id=execution_id,
+                    celery_task_id=str(async_result.id),
+                )
+            )
+        return dispatch_results

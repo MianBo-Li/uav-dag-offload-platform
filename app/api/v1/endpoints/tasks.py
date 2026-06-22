@@ -30,7 +30,10 @@ from app.schemas.task import (
     DagTaskRead,
 )
 from app.services.execution_dispatcher import ExecutionDispatcher
-from app.services.execution_service import ExecutionService
+from app.services.execution_service import (
+    ExecutionDispatchRegistration,
+    ExecutionService,
+)
 from app.services.metrics_service import MetricsService
 from app.services.scheduling_service import SchedulingService
 from app.services.task_service import TaskService
@@ -198,10 +201,11 @@ def execute_task(
     payload: ExecutionStartRequest,
     db: Session = Depends(get_db),
 ) -> ExecutionStartResponse:
-    result = ExecutionService(db).start_execution(task_id, payload.schedule_plan_id)
+    execution_service = ExecutionService(db)
+    result = execution_service.start_execution(task_id, payload.schedule_plan_id)
     db.commit()
     simulation = payload.simulation
-    queued_count = ExecutionDispatcher().enqueue_started_executions(
+    dispatch_results = ExecutionDispatcher().enqueue_started_executions(
         result.execution_ids,
         result_status=(
             simulation.result_status if simulation is not None else ExecutionStatus.SUCCESS
@@ -210,13 +214,23 @@ def execute_task(
         output_summary=simulation.output_summary if simulation is not None else None,
         failure_reason=simulation.failure_reason if simulation is not None else None,
     )
+    execution_service.record_celery_task_ids(
+        [
+            ExecutionDispatchRegistration(
+                execution_id=item.execution_id,
+                celery_task_id=item.celery_task_id,
+            )
+            for item in dispatch_results
+        ]
+    )
+    db.commit()
     return ExecutionStartResponse(
         task_id=result.task_id,
         schedule_plan_id=result.schedule_plan_id,
         status=result.status,
         execution_count=result.execution_count,
         execution_ids=result.execution_ids,
-        queued_count=queued_count,
+        queued_count=len(dispatch_results),
     )
 
 

@@ -171,12 +171,13 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - 任务取消时同步取消非终态子任务和运行中的执行记录。
 - Worker 迟到结果回传时返回 `accepted=false`，不覆盖已取消事实。
 - Worker 执行任务时刷新数据库心跳，并在 `/metrics` 暴露 Worker 在线数量。
+- API 投递 Celery 后保存 `celery_task_id`，取消任务时尝试安全 revoke。
 
 当前版本暂不实现：
 
 - 超时检测。
 - 独立周期性 Worker 心跳。
-- 主动撤销正在执行的 Celery Worker 任务。
+- 强制终止正在执行的 Celery Worker 子进程。
 - 死信队列和重试耗尽告警。
 - outbox pattern。
 
@@ -184,10 +185,10 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 8. 下一步学习重点
 
-RabbitMQ / Celery 的执行、幂等、队列监控、取消协调和 Worker 心跳第一版学习目标已经完成。后续可以继续推进：
+RabbitMQ / Celery 的执行、幂等、队列监控、取消协调、Worker 心跳第一版和安全 revoke 学习目标已经完成。后续可以继续推进：
 
 1. 独立周期性 Worker 心跳。
-2. 主动撤销正在执行的 Celery Worker 任务。
+2. Worker 周期性检查执行记录是否已取消。
 3. 死信队列和 Celery 重试耗尽后的告警。
 4. outbox pattern，避免数据库提交成功但消息投递失败。
 
@@ -590,12 +591,10 @@ cancel task
 - `subtasks`：调度器后续是否还能继续调度。
 - `execution_records`：Worker 回传结果是否还能被接受。
 
-当前版本仍然没有主动撤销正在执行的 Celery 任务。也就是说，Worker 进程可能仍然完成自己的模拟执行，只是数据库会拒绝它的迟到结果。
+当前版本已经能在保存 `celery_task_id` 后发出安全 revoke 请求。也就是说，尚未开始执行的 Celery 消息有机会被撤销；已经进入 Worker 代码的任务仍可能完成自己的模拟执行，数据库侧继续用 `accepted=false` 拒绝迟到结果。
 
 后续如果要更接近真实系统，可以继续学习：
 
-- 存储 Celery task id。
-- 调用 Celery revoke 或自定义取消消息。
 - Worker 定期检查执行记录是否已取消。
 - 结合 Worker 心跳判断正在执行的任务是否失联。
 
@@ -641,10 +640,57 @@ last_seen_at >= now - WORKER_HEARTBEAT_TIMEOUT_SECONDS
 - 这还不是独立周期性心跳，只有 Worker 执行任务时才会刷新。
 - 如果 Worker 长时间空闲，它不会主动刷新 `last_seen_at`。
 - 心跳失败只记录日志，不阻断真正的执行结果回传。
-- 还没有把 Celery task id 写入心跳表，因此还不能精准 revoke。
+- `celery_task_id` 已写入执行记录，当前 revoke 基于 `execution_records.celery_task_id`，心跳表仍只记录当前执行中的 `execution_id`。
 
 后续增强：
 
 - 增加 Celery boot/shutdown/task prerun/task postrun 信号级心跳。
 - 增加周期性 heartbeat task 或 Worker 内部定时上报。
 - 把心跳和主动撤销 Worker 任务联动起来。
+
+## 15. Celery task id 与安全 revoke
+
+任务取消协调第一版只做到了数据库事实层面：
+
+```text
+task -> CANCELED
+subtask -> CANCELED
+execution_record -> CANCELED
+late worker result -> accepted=false
+```
+
+这能保证数据库不会被迟到结果覆盖，但还不能向 Celery 发出撤销请求。
+
+当前版本新增 `execution_records.celery_task_id`：
+
+```text
+ExecutionService.start_execution()
+-> 创建 execution_record
+-> commit
+-> ExecutionDispatcher.enqueue_started_executions()
+-> Celery 返回 AsyncResult.id
+-> 回写 execution_records.celery_task_id
+```
+
+这样取消任务时，系统可以知道对应的 Celery 消息 id：
+
+```text
+TaskService.cancel_task()
+-> 锁定 RUNNING execution_record
+-> execution_record.status = CANCELED
+-> 如果 celery_task_id 存在
+-> celery_app.control.revoke(celery_task_id, terminate=False)
+```
+
+这里使用 `terminate=False` 是一个有意选择：
+
+- 可以撤销尚未开始执行的 Celery 消息。
+- 不会强杀 Worker 子进程，避免破坏共享资源或中断数据库事务。
+- 对已经开始执行的任务只是尽力而为，仍然需要数据库侧 `accepted=false` 兜底。
+
+当前边界：
+
+- revoke 失败只记录日志，不阻断任务取消。
+- 已经运行中的 Python 代码不会因为 `terminate=False` 立刻停止。
+- 要更接近真实停止，需要 Worker 在执行过程中周期性检查 execution_record 是否已取消。
+- 未来若要强制终止，可以评估 `terminate=True`，但要先理解它对资源清理和任务一致性的风险。
