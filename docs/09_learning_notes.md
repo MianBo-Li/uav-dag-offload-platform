@@ -1532,8 +1532,8 @@ alembic heads: 20260610_0006 (head)
 
 当前边界：
 
-- 当前实现是数据库事实层面的取消协调，还没有主动撤销正在执行的 Celery Worker 任务。
-- 系统还没有存储 Celery task id，因此不能精准调用 revoke。
+- 当前实现是数据库事实层面的取消协调；Celery task id 记录和安全 revoke 已在 6.32 补上。
+- 安全 revoke 仍然不会强制终止已经运行中的 Worker 代码。
 - Worker 也还没有周期性检查执行记录是否已取消。
 - 尚未实现 Worker 心跳、死信队列和重试耗尽告警。
 
@@ -1541,7 +1541,7 @@ alembic heads: 20260610_0006 (head)
 
 ```text
 Worker 心跳
--> 主动撤销正在执行的 Worker 任务
+-> Celery task id 与安全 revoke
 -> 死信队列和重试耗尽告警
 -> outbox pattern
 ```
@@ -1636,15 +1636,110 @@ docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
 
 - 这还是第一版心跳：只有 Worker 执行任务时才刷新，不是独立周期性心跳。
 - Worker 空闲很久时不会主动刷新 `last_seen_at`。
-- 还没有存储 Celery task id，暂时不能精准 revoke 正在执行的任务。
+- Celery task id 记录和安全 revoke 已在 6.32 补上，但还不能强制终止正在运行中的代码。
 - Grafana 只新增了在线 Worker 数面板，尚未做更细的 Worker 明细视图。
 
 下一步：
 
 ```text
 阶段性提交 Worker 心跳成果
--> 主动撤销正在执行的 Worker 任务
+-> Celery task id 与安全 revoke
 -> 死信队列和重试耗尽告警
+```
+
+### 6.32 Celery task id 与安全 revoke
+
+日期：2026-06-22
+
+目标：
+
+```text
+API 把 execution_id 投递给 Celery 后，
+把 Celery 返回的 task id 保存回 execution_record，
+取消任务时可以对尚未执行或可撤销的 Celery 任务发出 revoke 请求。
+```
+
+为什么要做：
+
+- 之前系统只能取消数据库里的 `execution_record`，不知道对应的 Celery 消息 id。
+- 没有 `celery_task_id`，后续无法对具体 Worker 任务做撤销、排查或观测。
+- 主动撤销要建立在“业务执行记录”和“消息队列任务”之间可追踪的映射上。
+
+涉及文件：
+
+- [app/db/models/task.py](../app/db/models/task.py)
+- [app/repositories/execution_repository.py](../app/repositories/execution_repository.py)
+- [app/services/execution_dispatcher.py](../app/services/execution_dispatcher.py)
+- [app/services/execution_service.py](../app/services/execution_service.py)
+- [app/services/execution_revoker.py](../app/services/execution_revoker.py)
+- [app/services/task_service.py](../app/services/task_service.py)
+- [app/api/v1/endpoints/tasks.py](../app/api/v1/endpoints/tasks.py)
+- [app/schemas/execution.py](../app/schemas/execution.py)
+- [alembic/versions/20260622_0008_add_execution_celery_task_id.py](../alembic/versions/20260622_0008_add_execution_celery_task_id.py)
+- [tests/services/test_execution_dispatcher.py](../tests/services/test_execution_dispatcher.py)
+- [tests/services/test_execution_service.py](../tests/services/test_execution_service.py)
+- [tests/api/test_tasks.py](../tests/api/test_tasks.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+ExecutionDispatcher.enqueue_started_executions()
+-> execute_subtask.delay(...)
+-> 读取 AsyncResult.id
+-> 返回 execution_id 与 celery_task_id 的映射
+
+ExecutionService.record_celery_task_ids()
+-> 回写 execution_records.celery_task_id
+
+TaskService.cancel_task()
+-> 锁定 RUNNING execution_record
+-> execution_record.status = CANCELED
+-> 如果 celery_task_id 存在
+-> ExecutionRevoker.revoke(celery_task_id)
+```
+
+学到的知识：
+
+- 异步系统里需要保存“业务 id”和“消息队列 id”的映射，否则后续无法定位、撤销或排障。
+- Celery 的 `AsyncResult.id` 是投递后才能拿到的，所以必须先创建并提交业务执行记录，再投递，再回写 task id。
+- `revoke(terminate=False)` 是安全撤销：不会强杀正在运行的 Worker 子进程。
+- 数据库取消仍然是最终一致性兜底，Worker 迟到结果仍然要依赖 `accepted=false` 保护。
+- revoke 失败不应该阻断任务取消，否则外部基础设施故障会反过来卡住业务状态推进。
+
+测试覆盖：
+
+```text
+Dispatcher: 自动投递开启时返回 execution_id 与 celery_task_id 映射
+Service: record_celery_task_ids() 能回写 execution_record
+Service: cancel_task() 会对带 celery_task_id 的运行中执行记录调用 revoker
+API: 自动投递后可在执行记录列表中看到 celery_task_id
+```
+
+验证结果：
+
+```text
+pytest: 104 passed
+pytest dispatcher / execution service / task API subset: 56 passed
+ruff --no-cache: All checks passed
+alembic heads: 20260622_0008 (head)
+docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
+```
+
+当前边界：
+
+- 当前使用 `terminate=False`，不会强制杀掉已经开始运行的 Python 代码。
+- 如果任务已经被 Worker 取走并正在执行，仍然需要 Worker 自己周期性检查数据库取消状态。
+- 还没有把 revoke 成功/失败写入审计表或事件表。
+- outbox pattern 仍未实现，因此“数据库提交成功但 Celery 投递失败”的一致性问题还没有最终解决。
+
+下一步：
+
+```text
+Worker 周期性检查 execution_record 是否已取消
+-> revoke 事件审计
+-> 死信队列和重试耗尽告警
+-> outbox pattern
 ```
 
 ## 8. 当前开发状态
@@ -1652,13 +1747,13 @@ docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，并新增了 Worker 心跳第一版。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，并支持保存 Celery task id 与安全 revoke。
 ```
 
 尚未完成：
 
 ```text
-主动撤销正在执行的 Celery Worker 任务
+Worker 周期性取消检查
 独立周期性 Worker 心跳
 死信队列和重试耗尽告警
 outbox pattern
@@ -1670,7 +1765,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把 Worker 心跳第一版整理成一次阶段性提交。
+也就是把 Celery task id 记录和安全 revoke 整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 
@@ -1794,7 +1889,7 @@ greedy
 
 ### 9.8 RabbitMQ / Celery
 
-状态：已开始，已完成第一版异步执行、失败重试、Celery 自动重试策略、队列监控、任务取消协调和 Worker 心跳。
+状态：已开始，已完成第一版异步执行、失败重试、Celery 自动重试策略、队列监控、任务取消协调、Worker 心跳、Celery task id 记录和安全 revoke。
 
 已经学到：
 
@@ -1813,11 +1908,13 @@ greedy
 - 为什么 Worker 迟到结果应该返回 `accepted=false`，而不是覆盖已取消状态。
 - 为什么 Worker 心跳要作为数据库事实保存，而不只依赖 RabbitMQ consumers。
 - 如何把 Worker 心跳转换成 Prometheus 指标和 Grafana 面板。
+- 为什么要保存业务 `execution_id` 和 Celery `task_id` 的映射。
+- 为什么 `revoke(terminate=False)` 是安全撤销而不是强制终止。
 
 后续继续学习：
 
 - 独立周期性 Worker 心跳。
-- 主动撤销正在执行的 Celery Worker 任务。
+- Worker 周期性取消检查。
 - 死信队列和重试耗尽告警。
 
 ### 9.9 MQTT
@@ -1934,12 +2031,13 @@ metrics-service
 -> Worker/队列监控指标
 -> 任务取消与 Worker 执行协调
 -> Worker 心跳第一版
+-> Celery task id 与安全 revoke
 ```
 
 下一阶段应继续完成：
 
 ```text
-独立周期性 Worker 心跳、主动撤销 Worker 任务、死信队列和告警
+Worker 周期性取消检查、独立周期性 Worker 心跳、死信队列和告警
 ```
 
 ## 13. 后续协作与记录约定
@@ -1979,6 +2077,6 @@ metrics-service
 当前下一步仍然是：
 
 ```text
-整理并提交当前 Worker 心跳成果
--> 再进入主动撤销 Worker 任务、死信队列和告警
+整理并提交当前 Celery task id 与安全 revoke 成果
+-> 再进入 Worker 周期性取消检查、死信队列和告警
 ```

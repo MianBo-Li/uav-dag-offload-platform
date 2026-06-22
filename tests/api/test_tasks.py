@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+import sys
+from types import ModuleType
 
 from fastapi.testclient import TestClient
 
@@ -97,6 +99,15 @@ def _non_retryable_local_capture_task_payload() -> dict[str, object]:
     assert isinstance(capture_subtask, dict)
     capture_subtask["max_retries"] = 0
     return payload
+
+
+class FakeCeleryTask:
+    def __init__(self) -> None:
+        self.sent_calls: list[tuple[str, dict[str, object]]] = []
+
+    def delay(self, execution_id: str, **kwargs: object):
+        self.sent_calls.append((execution_id, kwargs))
+        return type("FakeAsyncResult", (), {"id": "celery-task-api-1"})()
 
 
 def test_create_task_accepts_valid_dag(client: TestClient) -> None:
@@ -556,6 +567,44 @@ def test_execute_task_starts_execution_from_schedule_plan(client: TestClient) ->
 
     schedule_detail_response = client.get(f"/api/v1/schedules/{schedule_id}")
     assert schedule_detail_response.json()["status"] == "APPLIED"
+
+
+def test_execute_task_records_celery_task_id_after_enqueue(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    fake_task = FakeCeleryTask()
+    fake_worker_module = ModuleType("app.worker.tasks")
+    fake_worker_module.execute_subtask = fake_task
+    monkeypatch.setitem(sys.modules, "app.worker.tasks", fake_worker_module)
+    monkeypatch.setattr(
+        "app.services.execution_dispatcher.get_settings",
+        lambda: type("Settings", (), {"execution_auto_enqueue_enabled": True})(),
+    )
+
+    _create_ready_nodes(client)
+    create_response = client.post("/api/v1/tasks", json=_local_capture_task_payload())
+    task_id = create_response.json()["id"]
+    schedule_response = client.post(
+        f"/api/v1/tasks/{task_id}/schedule",
+        json={"strategy_name": "greedy"},
+    )
+
+    response = client.post(
+        f"/api/v1/tasks/{task_id}/execute",
+        json={"schedule_plan_id": schedule_response.json()["id"]},
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["queued_count"] == 1
+    execution_id = body["execution_ids"][0]
+    assert fake_task.sent_calls[0][0] == execution_id
+
+    executions_response = client.get(f"/api/v1/tasks/{task_id}/executions")
+    execution = executions_response.json()["items"][0]
+    assert execution["id"] == execution_id
+    assert execution["celery_task_id"] == "celery-task-api-1"
 
 
 def test_execute_task_rejects_non_terminal_simulated_result_status(

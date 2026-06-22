@@ -64,6 +64,7 @@ class ExecutionRecordRead(BaseModel):
     duration_ms: int | None
     output_summary: str | None
     failure_reason: str | None
+    celery_task_id: str | None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

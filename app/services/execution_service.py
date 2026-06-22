@@ -35,6 +35,12 @@ class ExecutionResult:
     accepted: bool
 
 
+@dataclass(frozen=True)
+class ExecutionDispatchRegistration:
+    execution_id: UUID
+    celery_task_id: str
+
+
 class ExecutionService:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -116,6 +122,17 @@ class ExecutionService:
     ) -> tuple[list[ExecutionRecord], int]:
         self.task_service.get_task(task_id)
         return self.execution_repository.list_by_task(task_id, status, page, page_size)
+
+    def record_celery_task_ids(
+        self,
+        dispatch_results: list[ExecutionDispatchRegistration],
+    ) -> None:
+        for item in dispatch_results:
+            self.execution_repository.set_celery_task_id(
+                item.execution_id,
+                item.celery_task_id,
+            )
+        self.db.flush()
 
     def report_result(
         self,

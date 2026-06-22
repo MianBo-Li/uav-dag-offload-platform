@@ -12,8 +12,11 @@ from app.domain.enums import (
     SubtaskExecutionConstraint,
 )
 from app.repositories.execution_repository import ExecutionRepository
-from app.schemas.task import DagTaskCreate, SubtaskCreate
-from app.services.execution_service import ExecutionService
+from app.schemas.task import DagTaskCancelRequest, DagTaskCreate, SubtaskCreate
+from app.services.execution_service import (
+    ExecutionDispatchRegistration,
+    ExecutionService,
+)
 from app.services.scheduling_service import SchedulingService
 from app.services.task_service import TaskService
 
@@ -99,3 +102,43 @@ def test_report_result_uses_locked_execution_lookup(
 
     assert locked_lookup_ids == [execution_id]
     assert result.accepted is True
+
+
+def test_record_celery_task_ids_updates_execution_record(db_session: Session) -> None:
+    execution_id = _start_ready_execution(db_session)
+
+    ExecutionService(db_session).record_celery_task_ids(
+        [
+            ExecutionDispatchRegistration(
+                execution_id=execution_id,
+                celery_task_id="celery-task-123",
+            )
+        ]
+    )
+
+    record = ExecutionRepository(db_session).get_plain_by_id(execution_id)
+    assert record is not None
+    assert record.celery_task_id == "celery-task-123"
+
+
+def test_cancel_running_execution_revokes_celery_task(db_session: Session) -> None:
+    execution_id = _start_ready_execution(db_session)
+    record = ExecutionRepository(db_session).get_plain_by_id(execution_id)
+    assert record is not None
+    record.celery_task_id = "celery-task-123"
+
+    class FakeExecutionRevoker:
+        def __init__(self) -> None:
+            self.revoked_ids: list[str] = []
+
+        def revoke(self, celery_task_id: str) -> bool:
+            self.revoked_ids.append(celery_task_id)
+            return True
+
+    revoker = FakeExecutionRevoker()
+    TaskService(db_session, execution_revoker=revoker).cancel_task(
+        record.task_id,
+        DagTaskCancelRequest(reason="operator canceled during execution"),
+    )
+
+    assert revoker.revoked_ids == ["celery-task-123"]

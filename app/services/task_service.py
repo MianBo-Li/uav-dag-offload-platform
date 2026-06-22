@@ -10,14 +10,20 @@ from app.domain.enums import ExecutionStatus, SubtaskStatus, TaskStatus
 from app.domain.state_machine import ensure_transition_allowed
 from app.repositories.execution_repository import ExecutionRepository
 from app.repositories.task_repository import TaskRepository
+from app.services.execution_revoker import ExecutionRevoker
 from app.schemas.task import DagTaskCancelRequest, DagTaskCreate
 
 
 class TaskService:
-    def __init__(self, db: Session) -> None:
+    def __init__(
+        self,
+        db: Session,
+        execution_revoker: ExecutionRevoker | None = None,
+    ) -> None:
         self.db = db
         self.repository = TaskRepository(db)
         self.execution_repository = ExecutionRepository(db)
+        self.execution_revoker = execution_revoker or ExecutionRevoker()
 
     def create_task(self, data: DagTaskCreate) -> DagTask:
         subtask_ids = [subtask.external_id for subtask in data.subtasks]
@@ -148,6 +154,8 @@ class TaskService:
             record.status = ExecutionStatus.CANCELED
             record.finished_at = canceled_at
             record.failure_reason = reason
+            if record.celery_task_id is not None:
+                self.execution_revoker.revoke(record.celery_task_id)
 
     @staticmethod
     def _cancel_non_terminal_subtasks(
