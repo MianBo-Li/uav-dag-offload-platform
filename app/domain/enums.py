@@ -12,6 +12,11 @@ class NodeStatus(StrEnum):
     OFFLINE = "OFFLINE"
 
 
+class WorkerStatus(StrEnum):
+    ONLINE = "ONLINE"
+    BUSY = "BUSY"
+
+
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     SCHEDULED = "SCHEDULED"

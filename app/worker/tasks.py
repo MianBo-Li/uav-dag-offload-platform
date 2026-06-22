@@ -1,3 +1,5 @@
+import os
+import socket
 from time import sleep
 from uuid import UUID
 
@@ -5,11 +7,12 @@ from celery import Task
 from celery.utils.log import get_task_logger
 from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as SQLAlchemyTimeoutError
 
-from app.core.errors import AppError
 from app.core.config import get_settings
+from app.core.errors import AppError
 from app.db.session import SessionLocal
-from app.domain.enums import ExecutionStatus
+from app.domain.enums import ExecutionStatus, WorkerStatus
 from app.services.execution_service import ExecutionService
+from app.services.worker_heartbeat_service import WorkerHeartbeatService
 from app.worker.celery_app import celery_app
 
 logger = get_task_logger(__name__)
@@ -33,6 +36,34 @@ def calculate_retry_countdown(
     return min(base_seconds * (2**retry_count), max_seconds)
 
 
+def resolve_worker_name(task: Task) -> str:
+    hostname = getattr(task.request, "hostname", None)
+    return str(hostname or socket.gethostname())
+
+
+def report_worker_heartbeat(
+    *,
+    worker_name: str,
+    status: WorkerStatus,
+    current_execution_id: UUID | None = None,
+) -> None:
+    db = SessionLocal()
+    try:
+        WorkerHeartbeatService(db).report_heartbeat(
+            worker_name=worker_name,
+            hostname=socket.gethostname(),
+            process_id=os.getpid(),
+            status=status,
+            current_execution_id=current_execution_id,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("Failed to report worker heartbeat", exc_info=True)
+    finally:
+        db.close()
+
+
 @celery_app.task(name="app.worker.tasks.execute_subtask", bind=True)
 def execute_subtask(
     self: Task,
@@ -43,6 +74,13 @@ def execute_subtask(
     failure_reason: str | None = None,
 ) -> dict[str, object]:
     settings = get_settings()
+    execution_uuid = UUID(execution_id)
+    worker_name = resolve_worker_name(self)
+    report_worker_heartbeat(
+        worker_name=worker_name,
+        status=WorkerStatus.BUSY,
+        current_execution_id=execution_uuid,
+    )
     if settings.simulated_execution_sleep_seconds > 0:
         sleep(settings.simulated_execution_sleep_seconds)
 
@@ -61,7 +99,7 @@ def execute_subtask(
     db = SessionLocal()
     try:
         result = ExecutionService(db).report_result(
-            UUID(execution_id),
+            execution_uuid,
             final_status,
             duration_ms=effective_duration_ms,
             output_summary=effective_output_summary,
@@ -98,3 +136,4 @@ def execute_subtask(
         raise
     finally:
         db.close()
+        report_worker_heartbeat(worker_name=worker_name, status=WorkerStatus.ONLINE)

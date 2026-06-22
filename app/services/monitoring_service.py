@@ -1,5 +1,6 @@
 from app.repositories.monitoring_repository import MonitoringRepository
 from app.services.queue_monitoring_service import RabbitMQQueueMonitoringService
+from app.services.worker_heartbeat_service import WorkerHeartbeatService
 
 
 class MonitoringService:
@@ -7,13 +8,18 @@ class MonitoringService:
         self,
         repository: MonitoringRepository,
         queue_monitor: RabbitMQQueueMonitoringService | None = None,
+        worker_heartbeat_service: WorkerHeartbeatService | None = None,
     ) -> None:
         self.repository = repository
         self.queue_monitor = queue_monitor or RabbitMQQueueMonitoringService()
+        self.worker_heartbeat_service = worker_heartbeat_service or WorkerHeartbeatService(
+            repository.db
+        )
 
     def render_prometheus_metrics(self) -> str:
         snapshot = self.repository.load_snapshot()
         queue_snapshot = self.queue_monitor.load_snapshot()
+        worker_snapshot = self.worker_heartbeat_service.load_snapshot()
         lines: list[str] = []
 
         _append_gauge(
@@ -127,6 +133,37 @@ class MonitoringService:
             "uav_dag_worker_retry_backoff_max_seconds",
             "Configured maximum retry backoff for execution worker tasks.",
             self.queue_monitor.settings.celery_execution_retry_backoff_max_seconds,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_heartbeat_timeout_seconds",
+            "Configured timeout for considering a worker heartbeat online.",
+            self.worker_heartbeat_service.settings.worker_heartbeat_timeout_seconds,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_workers_total",
+            "Current number of workers that have reported heartbeats.",
+            worker_snapshot.total_workers,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_workers_online",
+            "Current number of workers whose last heartbeat is within the timeout.",
+            worker_snapshot.online_workers,
+        )
+        _append_gauge(
+            lines,
+            "uav_dag_worker_latest_seen_timestamp",
+            "Latest worker heartbeat timestamp in Unix seconds.",
+            worker_snapshot.latest_seen_timestamp,
+        )
+        _append_labeled_gauge(
+            lines,
+            "uav_dag_workers_by_status_total",
+            "Current number of workers grouped by heartbeat status.",
+            "status",
+            worker_snapshot.workers_by_status,
         )
         _append_labeled_gauge(
             lines,
