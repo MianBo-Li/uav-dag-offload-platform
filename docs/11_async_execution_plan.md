@@ -170,11 +170,12 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 - RabbitMQ 队列监控指标。
 - 任务取消时同步取消非终态子任务和运行中的执行记录。
 - Worker 迟到结果回传时返回 `accepted=false`，不覆盖已取消事实。
+- Worker 执行任务时刷新数据库心跳，并在 `/metrics` 暴露 Worker 在线数量。
 
 当前版本暂不实现：
 
 - 超时检测。
-- Worker 心跳。
+- 独立周期性 Worker 心跳。
 - 主动撤销正在执行的 Celery Worker 任务。
 - 死信队列和重试耗尽告警。
 - outbox pattern。
@@ -183,9 +184,9 @@ EXECUTION_AUTO_ENQUEUE_ENABLED=true
 
 ## 8. 下一步学习重点
 
-RabbitMQ / Celery 的执行、幂等、队列监控和取消协调第一版学习目标已经完成。后续可以继续推进：
+RabbitMQ / Celery 的执行、幂等、队列监控、取消协调和 Worker 心跳第一版学习目标已经完成。后续可以继续推进：
 
-1. Worker 心跳。
+1. 独立周期性 Worker 心跳。
 2. 主动撤销正在执行的 Celery Worker 任务。
 3. 死信队列和 Celery 重试耗尽后的告警。
 4. outbox pattern，避免数据库提交成功但消息投递失败。
@@ -597,3 +598,53 @@ cancel task
 - 调用 Celery revoke 或自定义取消消息。
 - Worker 定期检查执行记录是否已取消。
 - 结合 Worker 心跳判断正在执行的任务是否失联。
+
+## 14. Worker 心跳第一版
+
+RabbitMQ 队列监控只能说明队列上有多少 consumer，但不能回答：
+
+```text
+具体哪个 Worker 最近还活着？
+它最后一次上报是什么时候？
+它当前是空闲还是正在执行某个 execution_id？
+```
+
+因此当前版本新增 `worker_heartbeats` 表，把 Worker 心跳作为数据库里的业务事实保存。
+
+当前实现方式：
+
+```text
+execute_subtask starts
+-> report worker heartbeat as BUSY with current_execution_id
+-> ExecutionService.report_result(...)
+-> report worker heartbeat as ONLINE
+```
+
+Prometheus 新增指标：
+
+```text
+uav_dag_worker_heartbeat_timeout_seconds
+uav_dag_workers_total
+uav_dag_workers_online
+uav_dag_worker_latest_seen_timestamp
+uav_dag_workers_by_status_total{status="ONLINE|BUSY"}
+```
+
+在线判定：
+
+```text
+last_seen_at >= now - WORKER_HEARTBEAT_TIMEOUT_SECONDS
+```
+
+当前边界：
+
+- 这还不是独立周期性心跳，只有 Worker 执行任务时才会刷新。
+- 如果 Worker 长时间空闲，它不会主动刷新 `last_seen_at`。
+- 心跳失败只记录日志，不阻断真正的执行结果回传。
+- 还没有把 Celery task id 写入心跳表，因此还不能精准 revoke。
+
+后续增强：
+
+- 增加 Celery boot/shutdown/task prerun/task postrun 信号级心跳。
+- 增加周期性 heartbeat task 或 Worker 内部定时上报。
+- 把心跳和主动撤销 Worker 任务联动起来。

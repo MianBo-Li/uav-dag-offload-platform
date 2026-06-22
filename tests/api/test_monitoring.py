@@ -1,6 +1,10 @@
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.domain.enums import WorkerStatus
+from app.services.worker_heartbeat_service import WorkerHeartbeatService
 
 
 def _single_subtask_payload() -> dict[str, object]:
@@ -59,6 +63,10 @@ def test_prometheus_metrics_empty_database(client: TestClient) -> None:
     assert "uav_dag_execution_duration_ms_count 0" in body
     assert "uav_dag_worker_auto_enqueue_enabled 0" in body
     assert "uav_dag_worker_retry_max_retries 3" in body
+    assert "uav_dag_worker_heartbeat_timeout_seconds 60" in body
+    assert "uav_dag_workers_total 0" in body
+    assert "uav_dag_workers_online 0" in body
+    assert "uav_dag_worker_latest_seen_timestamp 0" in body
     assert 'uav_dag_queue_monitor_enabled{queue="uav_dag_execution"} 0' in body
     assert 'uav_dag_queue_monitor_available{queue="uav_dag_execution"} 0' in body
     assert 'uav_dag_queue_messages{queue="uav_dag_execution"} 0' in body
@@ -101,3 +109,26 @@ def test_prometheus_metrics_after_execution(client: TestClient) -> None:
     assert 'uav_dag_executions_by_status_total{status="SUCCESS"} 1' in body
     assert "uav_dag_execution_duration_ms_sum 1234" in body
     assert "uav_dag_execution_duration_ms_count 1" in body
+
+
+def test_prometheus_metrics_after_worker_heartbeat(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    reported_at = datetime(2026, 6, 22, 10, 0, tzinfo=UTC)
+    WorkerHeartbeatService(db_session).report_heartbeat(
+        worker_name="worker-a",
+        hostname="host-a",
+        process_id=1001,
+        status=WorkerStatus.BUSY,
+        reported_at=reported_at,
+    )
+    db_session.commit()
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "uav_dag_workers_total 1" in body
+    assert 'uav_dag_workers_by_status_total{status="BUSY"} 1' in body
+    assert f"uav_dag_worker_latest_seen_timestamp {int(reported_at.timestamp())}" in body

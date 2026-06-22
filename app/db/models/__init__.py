@@ -9,6 +9,7 @@ from app.db.models.task import (
     SchedulePlan,
     SchedulePlanItem,
 )
+from app.db.models.worker import WorkerHeartbeat
 
 __all__ = [
     "DagDependency",
@@ -19,4 +20,5 @@ __all__ = [
     "NodeStatusRecord",
     "SchedulePlan",
     "SchedulePlanItem",
+    "WorkerHeartbeat",
 ]

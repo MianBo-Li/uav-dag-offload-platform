@@ -1546,19 +1546,120 @@ Worker 心跳
 -> outbox pattern
 ```
 
+### 6.31 Worker 心跳第一版
+
+日期：2026-06-22
+
+目标：
+
+```text
+让系统能从数据库和 /metrics 中看到 Celery Worker 最近一次心跳，
+初步判断 Worker 是否在线，以及当前是空闲还是正在执行任务。
+```
+
+为什么要做：
+
+- RabbitMQ consumers 只能说明队列上有消费者，不能说明具体 Worker 的最后活动时间。
+- 后续要做主动撤销 Worker 任务、失联检测和告警，必须先有 Worker 级别的心跳事实。
+- 心跳应该是业务可查询状态，不应该只散落在日志里。
+
+涉及文件：
+
+- [app/domain/enums.py](../app/domain/enums.py)
+- [app/db/models/worker.py](../app/db/models/worker.py)
+- [app/repositories/worker_repository.py](../app/repositories/worker_repository.py)
+- [app/services/worker_heartbeat_service.py](../app/services/worker_heartbeat_service.py)
+- [app/services/monitoring_service.py](../app/services/monitoring_service.py)
+- [app/worker/tasks.py](../app/worker/tasks.py)
+- [alembic/versions/20260622_0007_create_worker_heartbeats.py](../alembic/versions/20260622_0007_create_worker_heartbeats.py)
+- [tests/services/test_worker_heartbeat_service.py](../tests/services/test_worker_heartbeat_service.py)
+- [tests/api/test_monitoring.py](../tests/api/test_monitoring.py)
+- [monitoring/grafana/dashboards/uav-dag-overview.json](../monitoring/grafana/dashboards/uav-dag-overview.json)
+- [.env.example](../.env.example)
+- [docker-compose.yml](../docker-compose.yml)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+worker_heartbeats
+-> worker_name 唯一
+-> status = ONLINE / BUSY
+-> current_execution_id 记录当前执行中的 execution
+-> last_seen_at 用于在线判定
+
+execute_subtask()
+-> 开始时写 BUSY 心跳
+-> 结束时写 ONLINE 心跳
+-> 心跳失败只记录 warning，不阻断业务执行
+```
+
+新增 Prometheus 指标：
+
+```text
+uav_dag_worker_heartbeat_timeout_seconds
+uav_dag_workers_total
+uav_dag_workers_online
+uav_dag_worker_latest_seen_timestamp
+uav_dag_workers_by_status_total
+```
+
+学到的知识：
+
+- 队列监控和 Worker 心跳不是一回事：前者是 RabbitMQ 视角，后者是业务系统视角。
+- 心跳表适合用 upsert 语义，同一个 Worker 刷新同一行，而不是无限追加日志。
+- 在线判定不应该写死在接口里，而应该由 Service 根据 `last_seen_at` 和超时时间计算。
+- 心跳属于观测能力，失败时不能轻易阻断真正的任务执行。
+- SQLite 测试环境可能丢失 timezone 信息，时间戳计算要把 naive datetime 当作 UTC 处理。
+
+测试覆盖：
+
+```text
+Service: 同一个 worker_name 重复上报会更新同一条心跳
+Service: 根据 worker_heartbeat_timeout_seconds 统计在线 Worker
+API: /metrics 空数据库时暴露 Worker 心跳指标默认值
+API: /metrics 有 Worker 心跳时暴露 total / status / latest timestamp
+```
+
+验证结果：
+
+```text
+pytest: 101 passed
+pytest worker heartbeat / monitoring / worker retry subset: 11 passed
+ruff --no-cache: All checks passed
+alembic heads: 20260622_0007 (head)
+Grafana dashboard JSON parse: passed
+docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
+```
+
+当前边界：
+
+- 这还是第一版心跳：只有 Worker 执行任务时才刷新，不是独立周期性心跳。
+- Worker 空闲很久时不会主动刷新 `last_seen_at`。
+- 还没有存储 Celery task id，暂时不能精准 revoke 正在执行的任务。
+- Grafana 只新增了在线 Worker 数面板，尚未做更细的 Worker 明细视图。
+
+下一步：
+
+```text
+阶段性提交 Worker 心跳成果
+-> 主动撤销正在执行的 Worker 任务
+-> 死信队列和重试耗尽告警
+```
+
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，并完成了任务取消与 Worker 迟到结果的第一版协调。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，并新增了 Worker 心跳第一版。
 ```
 
 尚未完成：
 
 ```text
 主动撤销正在执行的 Celery Worker 任务
-Worker 心跳
+独立周期性 Worker 心跳
 死信队列和重试耗尽告警
 outbox pattern
 ```
@@ -1569,7 +1670,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把这次任务取消协调成果整理成一次阶段性提交，而不是继续堆更多未提交改动。
+也就是把 Worker 心跳第一版整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 
@@ -1693,7 +1794,7 @@ greedy
 
 ### 9.8 RabbitMQ / Celery
 
-状态：已开始，已完成第一版异步执行、失败重试、Celery 自动重试策略、队列监控和任务取消协调。
+状态：已开始，已完成第一版异步执行、失败重试、Celery 自动重试策略、队列监控、任务取消协调和 Worker 心跳。
 
 已经学到：
 
@@ -1710,10 +1811,12 @@ greedy
 - 如何把外部队列状态转换成 Prometheus 指标。
 - 为什么任务取消要同时协调总任务、子任务和执行记录。
 - 为什么 Worker 迟到结果应该返回 `accepted=false`，而不是覆盖已取消状态。
+- 为什么 Worker 心跳要作为数据库事实保存，而不只依赖 RabbitMQ consumers。
+- 如何把 Worker 心跳转换成 Prometheus 指标和 Grafana 面板。
 
 后续继续学习：
 
-- Worker 主动心跳。
+- 独立周期性 Worker 心跳。
 - 主动撤销正在执行的 Celery Worker 任务。
 - 死信队列和重试耗尽告警。
 
@@ -1830,12 +1933,13 @@ metrics-service
 -> 并发执行结果幂等锁
 -> Worker/队列监控指标
 -> 任务取消与 Worker 执行协调
+-> Worker 心跳第一版
 ```
 
 下一阶段应继续完成：
 
 ```text
-Worker 心跳、主动撤销 Worker 任务、死信队列和告警
+独立周期性 Worker 心跳、主动撤销 Worker 任务、死信队列和告警
 ```
 
 ## 13. 后续协作与记录约定
@@ -1875,6 +1979,6 @@ Worker 心跳、主动撤销 Worker 任务、死信队列和告警
 当前下一步仍然是：
 
 ```text
-整理并提交当前任务取消协调成果
--> 再进入 Worker 心跳、主动撤销 Worker 任务、死信队列和告警
+整理并提交当前 Worker 心跳成果
+-> 再进入主动撤销 Worker 任务、死信队列和告警
 ```

@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     simulated_execution_duration_ms: int = 100
     simulated_execution_sleep_seconds: float = 0.0
     heartbeat_timeout_seconds: int = 30
+    worker_heartbeat_timeout_seconds: int = 60
     default_scheduler_strategy: str = "greedy"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
