@@ -6,6 +6,7 @@ from app.db.models.task import (
     DagSubtask,
     DagTask,
     ExecutionRecord,
+    ExecutionRevokeEvent,
     SchedulePlan,
     SchedulePlanItem,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "DagSubtask",
     "DagTask",
     "ExecutionRecord",
+    "ExecutionRevokeEvent",
     "Node",
     "NodeStatusRecord",
     "SchedulePlan",
