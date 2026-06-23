@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     execution_auto_enqueue_enabled: bool = False
     simulated_execution_duration_ms: int = 100
     simulated_execution_sleep_seconds: float = 0.0
+    worker_cancel_check_interval_seconds: float = 0.2
     heartbeat_timeout_seconds: int = 30
     worker_heartbeat_timeout_seconds: int = 60
     default_scheduler_strategy: str = "greedy"

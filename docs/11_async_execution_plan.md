@@ -692,5 +692,32 @@ TaskService.cancel_task()
 
 - revoke 失败只记录日志，不阻断任务取消。
 - 已经运行中的 Python 代码不会因为 `terminate=False` 立刻停止。
-- 要更接近真实停止，需要 Worker 在执行过程中周期性检查 execution_record 是否已取消。
+- 当前已经加入 Worker 周期性取消检查：模拟执行 sleep 会被拆成小片段，片段之间查询 `execution_record.status`，发现 `CANCELED` 后提前退出并用 `accepted=false` 保护数据库状态。
 - 未来若要强制终止，可以评估 `terminate=True`，但要先理解它对资源清理和任务一致性的风险。
+
+## 16. Worker 周期性取消检查
+
+安全 revoke 只能尽力撤销尚未开始执行的 Celery 消息。对于已经进入 Worker 代码的任务，系统需要一种协作式取消机制：
+
+```text
+execute_subtask starts
+-> report heartbeat BUSY
+-> simulated sleep split into small intervals
+-> each interval checks execution_records.status
+-> if status is CANCELED
+-> stop waiting early
+-> report_result(CANCELED) returns accepted=false
+-> report heartbeat ONLINE
+```
+
+关键点：
+
+- `worker_cancel_check_interval_seconds` 控制轮询间隔，默认 0.2 秒。
+- `sleep_with_cancel_checks()` 支持注入 `sleep_fn` 和 `cancel_check_fn`，所以单元测试不需要真的等待。
+- Worker 不直接覆盖取消后的数据库状态，仍然走 `ExecutionService.report_result()` 的幂等入口。
+- 如果取消发生在最后一次检查之后、结果回传之前，行锁和 `accepted=false` 仍然会兜底。
+
+当前边界：
+
+- 这仍是模拟执行阶段的协作式取消；真实任务如果是长时间 CPU 计算或外部命令，还需要把检查点放进实际执行逻辑。
+- 高频轮询会增加数据库压力，真实系统里可以结合任务耗时、心跳和事件通知调节间隔。
