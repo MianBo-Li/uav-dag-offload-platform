@@ -1729,32 +1729,96 @@ docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
 当前边界：
 
 - 当前使用 `terminate=False`，不会强制杀掉已经开始运行的 Python 代码。
-- 如果任务已经被 Worker 取走并正在执行，仍然需要 Worker 自己周期性检查数据库取消状态。
+- 如果任务已经被 Worker 取走并正在执行，当前已经通过 Worker 周期性取消检查做协作式提前退出。
 - 还没有把 revoke 成功/失败写入审计表或事件表。
 - outbox pattern 仍未实现，因此“数据库提交成功但 Celery 投递失败”的一致性问题还没有最终解决。
 
 下一步：
 
 ```text
-Worker 周期性检查 execution_record 是否已取消
--> revoke 事件审计
+revoke 事件审计
 -> 死信队列和重试耗尽告警
 -> outbox pattern
 ```
+
+### 6.33 Worker 周期性取消检查
+
+日期：2026-06-23
+
+目标：
+
+```text
+让已经进入 Worker 代码的模拟执行任务，
+也能在执行过程中周期性发现数据库里的取消状态，
+从而比“等 sleep 结束再被 accepted=false 拒绝”更早退出。
+```
+
+为什么要做：
+
+- `revoke(terminate=False)` 对尚未开始执行的 Celery 消息有效，但不能立刻停止已经运行中的 Python 代码。
+- 只依赖最终回传时的 `accepted=false` 虽然安全，但 Worker 仍会白白等待完整模拟耗时。
+- 协作式取消更符合真实工程：让执行逻辑主动检查取消信号，而不是强杀进程。
+
+涉及文件：
+
+- [app/core/config.py](../app/core/config.py)
+- [app/worker/tasks.py](../app/worker/tasks.py)
+- [tests/worker/test_task_retry.py](../tests/worker/test_task_retry.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+execute_subtask()
+-> report_worker_heartbeat(BUSY)
+-> sleep_with_cancel_checks(...)
+-> is_execution_canceled(execution_id)
+-> 如果 execution_record.status == CANCELED
+-> 提前 report_result(CANCELED)
+-> report_result 发现记录已非 RUNNING，返回 accepted=false
+-> report_worker_heartbeat(ONLINE)
+```
+
+学到的知识：
+
+- 分布式任务取消通常分两层：消息层 revoke 负责“尽量不开始”，业务层取消检查负责“开始后尽早停”。
+- `terminate=False` 是安全选择，但它不是强制停止机制。
+- 长耗时逻辑如果写成一次性 `sleep()` 或一个大循环，就很难响应取消；要把执行拆成可检查的小片段。
+- 可测试性来自依赖注入：`sleep_with_cancel_checks()` 注入 `sleep_fn` 和 `cancel_check_fn`，测试就不用真的等时间流逝。
+- 即使 Worker 主动发现取消，也不应该绕过统一的 `ExecutionService.report_result()`，否则容易破坏幂等和状态机约束。
+
+测试覆盖：
+
+```text
+Worker: 已取消时不进入 sleep，立即返回取消
+Worker: 长 sleep 会按检查间隔分片，并在发现取消后提前停止
+```
+
+验证结果：
+
+```text
+pytest tests/worker/test_task_retry.py: 8 passed
+ruff targeted: All checks passed
+```
+
+当前边界：
+
+- 这次只覆盖模拟执行 sleep；真实执行外部命令、长 CPU 计算或网络调用时，还需要在真实执行步骤中放置取消检查点。
+- 轮询间隔越短，响应越快，但数据库查询越频繁，需要在真实负载下调参。
 
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，并支持保存 Celery task id 与安全 revoke。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，并加入了 Worker 周期性取消检查。
 ```
 
 尚未完成：
 
 ```text
-Worker 周期性取消检查
 独立周期性 Worker 心跳
+revoke 事件审计
 死信队列和重试耗尽告警
 outbox pattern
 ```
@@ -1765,7 +1829,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把 Celery task id 记录和安全 revoke 整理成一次阶段性提交。
+也就是把 Worker 周期性取消检查整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 
