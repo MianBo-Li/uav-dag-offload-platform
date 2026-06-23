@@ -721,3 +721,44 @@ execute_subtask starts
 
 - 这仍是模拟执行阶段的协作式取消；真实任务如果是长时间 CPU 计算或外部命令，还需要把检查点放进实际执行逻辑。
 - 高频轮询会增加数据库压力，真实系统里可以结合任务耗时、心跳和事件通知调节间隔。
+
+## 17. revoke 事件审计
+
+安全 revoke 解决的是“尝试撤销消息”的能力，但排查系统时还需要回答：
+
+```text
+取消任务时有没有发 revoke？
+撤销的是哪个 celery_task_id？
+Celery 返回成功还是失败？
+```
+
+当前版本新增 `execution_revoke_events` 表：
+
+```text
+TaskService.cancel_task()
+-> lock RUNNING execution records
+-> mark execution_record CANCELED
+-> if celery_task_id exists
+-> ExecutionRevoker.revoke(celery_task_id)
+-> RevokeEventRepository.create(...)
+```
+
+记录字段：
+
+- `task_id`
+- `execution_id`
+- `celery_task_id`
+- `success`
+- `error_message`
+- `requested_at`
+
+关键点：
+
+- revoke 成功或失败都会写审计事件。
+- revoke 返回 `False` 不阻断任务取消，只把失败事实写入 `error_message`。
+- 审计事件和任务取消在同一数据库事务里提交，便于保持业务状态和审计记录一致。
+
+当前边界：
+
+- 审计表先只落库，还没有查询 API。
+- 审计事件仍受当前事务影响；如果后续要进一步保证外部副作用和数据库记录一致，需要结合 outbox pattern。

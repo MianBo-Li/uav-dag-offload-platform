@@ -9,6 +9,7 @@ from app.domain.dag import validate_dag
 from app.domain.enums import ExecutionStatus, SubtaskStatus, TaskStatus
 from app.domain.state_machine import ensure_transition_allowed
 from app.repositories.execution_repository import ExecutionRepository
+from app.repositories.revoke_event_repository import RevokeEventRepository
 from app.repositories.task_repository import TaskRepository
 from app.services.execution_revoker import ExecutionRevoker
 from app.schemas.task import DagTaskCancelRequest, DagTaskCreate
@@ -23,6 +24,7 @@ class TaskService:
         self.db = db
         self.repository = TaskRepository(db)
         self.execution_repository = ExecutionRepository(db)
+        self.revoke_event_repository = RevokeEventRepository(db)
         self.execution_revoker = execution_revoker or ExecutionRevoker()
 
     def create_task(self, data: DagTaskCreate) -> DagTask:
@@ -155,7 +157,22 @@ class TaskService:
             record.finished_at = canceled_at
             record.failure_reason = reason
             if record.celery_task_id is not None:
-                self.execution_revoker.revoke(record.celery_task_id)
+                success, error_message = self._revoke_execution(record.celery_task_id)
+                self.revoke_event_repository.create(
+                    task_id=record.task_id,
+                    execution_id=record.id,
+                    celery_task_id=record.celery_task_id,
+                    success=success,
+                    error_message=error_message,
+                    requested_at=canceled_at,
+                )
+
+    def _revoke_execution(self, celery_task_id: str) -> tuple[bool, str | None]:
+        try:
+            success = self.execution_revoker.revoke(celery_task_id)
+        except Exception as exc:
+            return False, str(exc)
+        return success, None if success else "Celery revoke returned false"
 
     @staticmethod
     def _cancel_non_terminal_subtasks(

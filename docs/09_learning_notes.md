@@ -1736,8 +1736,7 @@ docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
 下一步：
 
 ```text
-revoke 事件审计
--> 死信队列和重试耗尽告警
+死信队列和重试耗尽告警
 -> outbox pattern
 ```
 
@@ -1806,19 +1805,84 @@ ruff targeted: All checks passed
 - 这次只覆盖模拟执行 sleep；真实执行外部命令、长 CPU 计算或网络调用时，还需要在真实执行步骤中放置取消检查点。
 - 轮询间隔越短，响应越快，但数据库查询越频繁，需要在真实负载下调参。
 
+### 6.34 revoke 事件审计
+
+日期：2026-06-23
+
+目标：
+
+```text
+取消运行中任务时，
+如果系统对 celery_task_id 发出 revoke，
+就把这次 revoke 尝试记录到数据库审计表中。
+```
+
+为什么要做：
+
+- 之前 `ExecutionRevoker.revoke()` 只返回成功/失败，取消完成后很难追踪“到底撤销了哪条 Celery 消息”。
+- 分布式系统排查问题时，状态表只能说明当前事实，事件表能说明“发生过什么”。
+- revoke 失败不应该阻断业务取消，但失败事实应该被保存，方便后续告警和诊断。
+
+涉及文件：
+
+- [app/db/models/task.py](../app/db/models/task.py)
+- [app/db/models/__init__.py](../app/db/models/__init__.py)
+- [app/repositories/revoke_event_repository.py](../app/repositories/revoke_event_repository.py)
+- [app/services/task_service.py](../app/services/task_service.py)
+- [alembic/versions/20260623_0009_create_execution_revoke_events.py](../alembic/versions/20260623_0009_create_execution_revoke_events.py)
+- [tests/services/test_execution_service.py](../tests/services/test_execution_service.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+TaskService.cancel_task()
+-> _cancel_running_executions()
+-> execution_record.status = CANCELED
+-> ExecutionRevoker.revoke(celery_task_id)
+-> RevokeEventRepository.create(...)
+-> execution_revoke_events 写入 success / error_message
+```
+
+学到的知识：
+
+- 审计表和状态表用途不同：状态表回答“现在是什么”，审计表回答“之前发生了什么”。
+- 外部系统调用结果最好落库，否则只靠日志很难做 API 查询、告警和长期分析。
+- revoke 失败不应阻断取消主流程，因为业务取消的数据库事实更重要。
+- 把审计写入同一事务，能保证“任务被取消”和“系统尝试过 revoke”一起提交；但外部副作用和事务之间仍有一致性边界。
+
+测试覆盖：
+
+```text
+Service: cancel_task() revoke 成功时写 success=true 的审计事件
+Service: revoke 返回 false 时写 success=false 和错误信息
+```
+
+验证结果：
+
+```text
+pytest tests/services/test_execution_service.py: 4 passed
+ruff app tests alembic: All checks passed
+alembic heads: 20260623_0009 (head)
+```
+
+当前边界：
+
+- 审计表暂时没有查询 API，后续可以加 `/tasks/{task_id}/revoke-events` 或运维查询接口。
+- 如果未来要保证“数据库提交后一定发送 revoke”或“发送 revoke 后一定记录事件”，需要引入 outbox pattern。
+
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，并加入了 Worker 周期性取消检查。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，并能记录 revoke 事件审计。
 ```
 
 尚未完成：
 
 ```text
 独立周期性 Worker 心跳
-revoke 事件审计
 死信队列和重试耗尽告警
 outbox pattern
 ```
@@ -1829,7 +1893,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把 Worker 周期性取消检查整理成一次阶段性提交。
+也就是把 Worker 周期性取消检查和 revoke 事件审计整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 
