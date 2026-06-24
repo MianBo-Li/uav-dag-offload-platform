@@ -219,13 +219,14 @@
 -> RabbitMQ DLQ 配置第一版
 -> DLQ 监控指标第一版
 -> DLQ 查询 API 第一版
+-> DLQ 流转验证脚本
 ```
 
 当前最应该做的是：
 
-1. 阶段性整理当前取消协作、revoke 审计、重试耗尽告警、DLQ 配置、DLQ 监控和 DLQ 查询 API 成果，保证测试、文档和数据库迁移验证一致。
+1. 阶段性整理当前取消协作、revoke 审计、重试耗尽告警、DLQ 配置、DLQ 监控、DLQ 查询 API 和 DLQ 流转验证脚本成果，保证测试、文档和数据库迁移验证一致。
 2. 做一次清晰提交或 PR，把这一阶段成果固化下来。
-3. 进入下一阶段增强：DLQ 真实流转验证、Grafana Alerting 规则和 outbox pattern。
+3. 进入下一阶段增强：DLQ 容器级实跑验证、Grafana Alerting 规则和 outbox pattern。
 
 后续开发应继续遵循：
 

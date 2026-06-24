@@ -393,6 +393,23 @@ GET /api/v1/dead-letter-queue/messages?limit=10&truncate=4096
 
 `/messages` 当前使用 RabbitMQ Management API 的 `ack_requeue_true` 模式，只用于安全查看消息，不会确认、删除或重放 DLQ 消息。
 
+DLQ 真实流转验证脚本：
+
+```text
+.\.venv\Scripts\python.exe scripts\verify_dlq_flow.py
+```
+
+脚本会声明临时 probe queue，发布探针消息，再用 `reject_requeue_false` 触发死信流转，最后用 `ack_requeue_true` 从 `uav_dag_execution.dlq` 安全查看探针消息。
+
+成功时关键字段应为：
+
+```text
+main_queue_dead_letter_configured = true
+published = true
+rejected = true
+found_in_dlq = true
+```
+
 ## 7. RabbitMQ DLQ 配置补充
 
 Compose 已显式配置 Celery 主执行队列和死信路由参数：
@@ -427,4 +444,5 @@ Worker 命令通过 `--queues=${CELERY_TASK_DEFAULT_QUEUE}` 限制只消费主�
 
 - 这只是 DLQ 拓扑配置第一版。
 - `/metrics` 已经能观察主执行队列和 DLQ 的消息数、ready 数、unacked 数和消费者数。
-- 已经实现 DLQ 查询 API 第一版，但还没有实现 DLQ 消费者、消息重放或真实死信流转验证。
+- 已经实现 DLQ 查询 API 第一版和 DLQ 流转验证脚本，但当前开发机 Docker Desktop 未运行，所以还没有完成容器级实跑。
+- 还没有实现 DLQ 消费者或消息重放。

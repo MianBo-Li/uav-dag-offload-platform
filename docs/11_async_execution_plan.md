@@ -964,3 +964,52 @@ items[]
 - 还没有实现 DLQ 消费者。
 - 还没有实现把 DLQ 消息安全重放回主执行队列。
 - 真实消息能否进入 DLQ 仍取决于 Celery ack/reject 行为，需要 Docker 环境验证。
+
+## 22. DLQ 流转验证脚本
+
+为了验证 RabbitMQ 运行时真的能把 rejected 消息送入 DLQ，当前新增脚本：
+
+```text
+scripts/verify_dlq_flow.py
+```
+
+运行命令：
+
+```text
+.\.venv\Scripts\python.exe scripts\verify_dlq_flow.py
+```
+
+脚本不是从主业务队列里拿真实 execution 消息，而是创建临时 probe queue：
+
+```text
+检查主队列 dead-letter 参数
+-> 声明临时 probe queue，配置同一套 DLX 参数
+-> 绑定 probe queue 到主 exchange 的唯一 routing key
+-> 发布 probe 消息
+-> 从 probe queue 以 reject_requeue_false 取出消息
+-> RabbitMQ 触发 dead-letter routing
+-> 从真实 DLQ 以 ack_requeue_true 安全查看 probe 消息
+-> 删除临时 probe queue
+```
+
+关键 ack mode：
+
+```text
+reject_requeue_false  触发死信流转
+ack_requeue_true      安全查看 DLQ，不删除消息
+```
+
+成功输出中应看到：
+
+```text
+main_queue_dead_letter_configured: true
+published: true
+rejected: true
+found_in_dlq: true
+```
+
+当前边界：
+
+- 当前开发机 Docker Desktop 未运行，因此本轮没有完成容器级实跑。
+- 脚本会保留 probe 消息在真实 DLQ 中，作为流转证据。
+- 这仍然不是 DLQ 消费者，也没有实现死信重放。
