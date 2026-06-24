@@ -3,6 +3,7 @@ from sqlalchemy.exc import DBAPIError, OperationalError, TimeoutError as SQLAlch
 from app.core.errors import AppError
 from app.worker.tasks import (
     calculate_retry_countdown,
+    has_worker_retry_budget,
     is_retryable_worker_exception,
     sleep_with_cancel_checks,
 )
@@ -62,6 +63,12 @@ def test_retry_countdown_uses_exponential_backoff_with_cap() -> None:
         base_seconds=5,
         max_seconds=60,
     ) == 60
+
+
+def test_worker_retry_budget_allows_retries_before_limit() -> None:
+    assert has_worker_retry_budget(retry_count=0, max_retries=3) is True
+    assert has_worker_retry_budget(retry_count=2, max_retries=3) is True
+    assert has_worker_retry_budget(retry_count=3, max_retries=3) is False
 
 
 def test_sleep_with_cancel_checks_returns_immediately_when_already_canceled() -> None:

@@ -358,10 +358,15 @@ task_status: SUCCESS
 uav_dag_worker_auto_enqueue_enabled
 uav_dag_worker_retry_max_retries
 uav_dag_queue_monitor_available{queue="uav_dag_execution"}
+uav_dag_queue_monitor_available{queue="uav_dag_execution.dlq"}
 uav_dag_queue_messages{queue="uav_dag_execution"}
+uav_dag_queue_messages{queue="uav_dag_execution.dlq"}
 uav_dag_queue_messages_ready{queue="uav_dag_execution"}
+uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"}
 uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution"}
+uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution.dlq"}
 uav_dag_queue_consumers{queue="uav_dag_execution"}
+uav_dag_queue_consumers{queue="uav_dag_execution.dlq"}
 ```
 
 Grafana dashboard 已增加：
@@ -369,6 +374,8 @@ Grafana dashboard 已增加：
 ```text
 Queue Messages
 Queue Consumers
+Worker Alerts
+DLQ Ready Messages
 ```
 
 更详细的学习记录见：
@@ -376,3 +383,39 @@ Queue Consumers
 ```text
 docs/11_async_execution_plan.md
 ```
+
+## 7. RabbitMQ DLQ 配置补充
+
+Compose 已显式配置 Celery 主执行队列和死信路由参数：
+
+```text
+CELERY_TASK_DEFAULT_QUEUE=uav_dag_execution
+CELERY_TASK_DEFAULT_EXCHANGE=uav_dag_execution
+CELERY_TASK_DEFAULT_ROUTING_KEY=uav_dag_execution
+CELERY_TASK_DEAD_LETTER_EXCHANGE=uav_dag_execution.dlx
+CELERY_TASK_DEAD_LETTER_ROUTING_KEY=uav_dag_execution.dead
+CELERY_TASK_DEAD_LETTER_QUEUE=uav_dag_execution.dlq
+```
+
+当前代码会让 Celery 主队列声明带上：
+
+```text
+x-dead-letter-exchange = uav_dag_execution.dlx
+x-dead-letter-routing-key = uav_dag_execution.dead
+```
+
+Worker 启动时还会尽力声明：
+
+```text
+dead-letter exchange = uav_dag_execution.dlx
+dead-letter queue    = uav_dag_execution.dlq
+routing key          = uav_dag_execution.dead
+```
+
+Worker 命令通过 `--queues=${CELERY_TASK_DEFAULT_QUEUE}` 限制只消费主执行队列，避免误消费 DLQ。
+
+当前边界：
+
+- 这只是 DLQ 拓扑配置第一版。
+- `/metrics` 已经能观察主执行队列和 DLQ 的消息数、ready 数、unacked 数和消费者数。
+- 还没有实现 DLQ 消费者、DLQ 消息查询 API 或真实死信流转验证。

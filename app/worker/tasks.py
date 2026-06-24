@@ -13,6 +13,7 @@ from app.db.session import SessionLocal
 from app.domain.enums import ExecutionStatus, WorkerStatus
 from app.repositories.execution_repository import ExecutionRepository
 from app.services.execution_service import ExecutionService
+from app.services.worker_alert_service import WorkerAlertService
 from app.services.worker_heartbeat_service import WorkerHeartbeatService
 from app.worker.celery_app import celery_app
 
@@ -35,6 +36,10 @@ def calculate_retry_countdown(
     max_seconds: int,
 ) -> int:
     return min(base_seconds * (2**retry_count), max_seconds)
+
+
+def has_worker_retry_budget(retry_count: int, max_retries: int) -> bool:
+    return retry_count < max_retries
 
 
 def resolve_worker_name(task: Task) -> str:
@@ -61,6 +66,33 @@ def report_worker_heartbeat(
     except Exception:
         db.rollback()
         logger.warning("Failed to report worker heartbeat", exc_info=True)
+    finally:
+        db.close()
+
+
+def report_retry_exhausted_alert(
+    *,
+    execution_id: UUID,
+    worker_name: str,
+    celery_task_id: str | None,
+    retry_count: int,
+    max_retries: int,
+    exc: Exception,
+) -> None:
+    db = SessionLocal()
+    try:
+        WorkerAlertService(db).report_retry_exhausted(
+            execution_id=execution_id,
+            worker_name=worker_name,
+            celery_task_id=celery_task_id,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            exc=exc,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("Failed to report retry exhausted alert", exc_info=True)
     finally:
         db.close()
 
@@ -165,10 +197,30 @@ def execute_subtask(
             "accepted": result.accepted,
         }
     except Exception as exc:
-        db.rollback()
+        if db is not None:
+            db.rollback()
         if is_retryable_worker_exception(exc):
+            retry_count = self.request.retries
+            max_retries = settings.celery_execution_max_retries
+            if not has_worker_retry_budget(retry_count, max_retries):
+                report_retry_exhausted_alert(
+                    execution_id=execution_uuid,
+                    worker_name=worker_name,
+                    celery_task_id=getattr(self.request, "id", None),
+                    retry_count=retry_count,
+                    max_retries=max_retries,
+                    exc=exc,
+                )
+                logger.error(
+                    "Execution task %s exhausted retry budget after %s retries",
+                    execution_id,
+                    retry_count,
+                    exc_info=True,
+                )
+                raise
+
             retry_countdown = calculate_retry_countdown(
-                self.request.retries,
+                retry_count,
                 settings.celery_execution_retry_backoff_seconds,
                 settings.celery_execution_retry_backoff_max_seconds,
             )
