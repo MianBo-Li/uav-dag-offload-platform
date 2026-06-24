@@ -45,6 +45,9 @@ class RabbitMQDeadLetterFlowVerifier:
 
         try:
             main_queue_dead_letter_configured = self._main_queue_has_dead_letter_config()
+            self._declare_dead_letter_exchange()
+            self._declare_dead_letter_queue()
+            self._bind_dead_letter_queue()
             self._declare_probe_queue(probe_queue)
             self._bind_probe_queue(probe_queue, probe_routing_key)
             published = self._publish_probe_message(
@@ -108,10 +111,47 @@ class RabbitMQDeadLetterFlowVerifier:
             },
         )
 
+    def _declare_dead_letter_exchange(self) -> None:
+        self._request_json(
+            "PUT",
+            self._exchange_url(self.settings.celery_task_dead_letter_exchange),
+            {
+                "type": "direct",
+                "durable": True,
+                "auto_delete": False,
+                "internal": False,
+                "arguments": {},
+            },
+        )
+
+    def _declare_dead_letter_queue(self) -> None:
+        self._request_json(
+            "PUT",
+            self._queue_url(self.settings.celery_task_dead_letter_queue),
+            {
+                "durable": True,
+                "auto_delete": False,
+                "arguments": {},
+            },
+        )
+
+    def _bind_dead_letter_queue(self) -> None:
+        self._request_json(
+            "POST",
+            self._binding_url(
+                exchange_name=self.settings.celery_task_dead_letter_exchange,
+                queue_name=self.settings.celery_task_dead_letter_queue,
+            ),
+            {"routing_key": self.settings.celery_task_dead_letter_routing_key},
+        )
+
     def _bind_probe_queue(self, probe_queue: str, routing_key: str) -> None:
         self._request_json(
             "POST",
-            self._binding_url(probe_queue),
+            self._binding_url(
+                exchange_name=self.settings.celery_task_default_exchange,
+                queue_name=probe_queue,
+            ),
             {"routing_key": routing_key},
         )
 
@@ -227,14 +267,18 @@ class RabbitMQDeadLetterFlowVerifier:
     def _queue_url(self, queue_name: str) -> str:
         return f"{self._base_url()}/queues/{self._vhost()}/{quote(queue_name, safe='')}"
 
-    def _binding_url(self, queue_name: str) -> str:
-        exchange = quote(self.settings.celery_task_default_exchange, safe="")
+    def _binding_url(self, *, exchange_name: str, queue_name: str) -> str:
+        exchange = quote(exchange_name, safe="")
         queue = quote(queue_name, safe="")
         return f"{self._base_url()}/bindings/{self._vhost()}/e/{exchange}/q/{queue}"
 
+    def _exchange_url(self, exchange_name: str) -> str:
+        exchange = quote(exchange_name, safe="")
+        return f"{self._base_url()}/exchanges/{self._vhost()}/{exchange}"
+
     def _exchange_publish_url(self) -> str:
         exchange = quote(self.settings.celery_task_default_exchange, safe="")
-        return f"{self._base_url()}/exchanges/{self._vhost()}/e/{exchange}/publish"
+        return f"{self._base_url()}/exchanges/{self._vhost()}/{exchange}/publish"
 
     def _delete_probe_queue(self, queue_name: str) -> None:
         self._request_json("DELETE", self._queue_url(queue_name))

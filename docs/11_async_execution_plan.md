@@ -1008,8 +1008,51 @@ rejected: true
 found_in_dlq: true
 ```
 
+2026-06-24 容器级实跑结果：
+
+```text
+main_queue_dead_letter_configured: true
+published: true
+rejected: true
+found_in_dlq: true
+dlq_message_count: 3
+```
+
+同时验证：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> headers.x-first-death-reason = rejected
+-> headers.x-first-death-exchange = uav_dag_execution
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
+本次实跑发现并处理了旧拓扑迁移问题：
+
+```text
+旧队列 uav_dag_execution 已存在，arguments={}
+新 Worker 声明同名队列时带 dead-letter 参数
+RabbitMQ 返回 PRECONDITION_FAILED
+```
+
+RabbitMQ 不允许原地改变已有队列的关键 arguments。开发环境中的处理方式是：
+
+```text
+确认主队列 messages=0
+-> 停止 worker
+-> 删除旧主队列
+-> rebuild api/worker 镜像
+-> 启动 worker
+-> 新队列带 x-dead-letter-exchange / x-dead-letter-routing-key
+```
+
 当前边界：
 
-- 当前开发机 Docker Desktop 未运行，因此本轮没有完成容器级实跑。
+- 容器级 DLQ 流转已经验证通过。
 - 脚本会保留 probe 消息在真实 DLQ 中，作为流转证据。
 - 这仍然不是 DLQ 消费者，也没有实现死信重放。

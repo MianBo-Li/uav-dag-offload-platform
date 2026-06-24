@@ -410,6 +410,29 @@ rejected = true
 found_in_dlq = true
 ```
 
+2026-06-24 Docker 实跑结果：
+
+```text
+main_queue_dead_letter_configured = true
+published = true
+rejected = true
+found_in_dlq = true
+dlq_message_count = 3
+```
+
+验证后 API 和 metrics 也能看到 DLQ：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> x-first-death-reason = rejected
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
 ## 7. RabbitMQ DLQ 配置补充
 
 Compose 已显式配置 Celery 主执行队列和死信路由参数：
@@ -444,5 +467,5 @@ Worker 命令通过 `--queues=${CELERY_TASK_DEFAULT_QUEUE}` 限制只消费主�
 
 - 这只是 DLQ 拓扑配置第一版。
 - `/metrics` 已经能观察主执行队列和 DLQ 的消息数、ready 数、unacked 数和消费者数。
-- 已经实现 DLQ 查询 API 第一版和 DLQ 流转验证脚本，但当前开发机 Docker Desktop 未运行，所以还没有完成容器级实跑。
+- 已经实现 DLQ 查询 API 第一版和 DLQ 流转验证脚本，并完成 Docker/RabbitMQ 容器级实跑。
 - 还没有实现 DLQ 消费者或消息重放。

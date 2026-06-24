@@ -2246,10 +2246,56 @@ Service: 验证 DLQ peek 使用 ack_requeue_true
 Script: py_compile 语法检查
 ```
 
+Docker 实跑结果：
+
+```json
+{
+  "main_queue_dead_letter_configured": true,
+  "published": true,
+  "rejected": true,
+  "found_in_dlq": true,
+  "dlq_message_count": 3,
+  "error_message": null
+}
+```
+
+同时通过 API 验证：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> headers.x-first-death-reason = rejected
+-> headers.x-first-death-exchange = uav_dag_execution
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
+这次实跑还暴露了一个很真实的运维问题：
+
+```text
+旧 RabbitMQ 队列 uav_dag_execution 已经存在，arguments={}
+新 Worker 声明同名队列时带 x-dead-letter-exchange
+RabbitMQ 返回 PRECONDITION_FAILED
+```
+
+处理方式：
+
+```text
+确认主队列 messages=0
+-> 停止 worker
+-> 删除旧的空主队列
+-> rebuild api/worker 镜像
+-> 启动 worker
+-> 新队列 arguments 带上 x-dead-letter-exchange / x-dead-letter-routing-key
+```
+
 当前边界：
 
-- 当前机器 Docker Desktop 未运行，因此本轮没有完成容器级实跑。
-- 脚本会把探针消息留在真实 DLQ 中用于证明流转，后续可通过 DLQ 查询 API 观察。
+- 容器级 DLQ 流转已经验证通过。
+- 脚本会把探针消息留在真实 DLQ 中用于证明流转，可通过 DLQ 查询 API 观察。
 - 这仍然不是 DLQ 消费者，也没有实现消息重放。
 
 ## 8. 当前开发状态
@@ -2257,14 +2303,13 @@ Script: py_compile 语法检查
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，能记录 revoke 事件审计，新增了 Celery 重试耗尽告警第一版、告警查询 API 和 Grafana Worker Alerts 面板，并为 Celery 主执行队列配置了 RabbitMQ DLQ 路由参数和 DLQ 拓扑声明，同时把 DLQ 消息数接入了 /metrics 和 Grafana，补上了安全 peek 的 DLQ 查询 API 第一版，并新增了可重复运行的 DLQ 流转验证脚本。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，能记录 revoke 事件审计，新增了 Celery 重试耗尽告警第一版、告警查询 API 和 Grafana Worker Alerts 面板，并为 Celery 主执行队列配置了 RabbitMQ DLQ 路由参数和 DLQ 拓扑声明，同时把 DLQ 消息数接入了 /metrics 和 Grafana，补上了安全 peek 的 DLQ 查询 API 第一版，新增了可重复运行的 DLQ 流转验证脚本，并已经完成 Docker/RabbitMQ 容器级实跑验证。
 ```
 
 尚未完成：
 
 ```text
 独立周期性 Worker 心跳
-RabbitMQ DLQ 容器级实跑验证
 Grafana Alerting 规则
 outbox pattern
 ```
