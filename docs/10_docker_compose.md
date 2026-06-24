@@ -384,6 +384,15 @@ DLQ Ready Messages
 docs/11_async_execution_plan.md
 ```
 
+DLQ 查询接口：
+
+```text
+GET /api/v1/dead-letter-queue
+GET /api/v1/dead-letter-queue/messages?limit=10&truncate=4096
+```
+
+`/messages` 当前使用 RabbitMQ Management API 的 `ack_requeue_true` 模式，只用于安全查看消息，不会确认、删除或重放 DLQ 消息。
+
 ## 7. RabbitMQ DLQ 配置补充
 
 Compose 已显式配置 Celery 主执行队列和死信路由参数：
@@ -418,4 +427,4 @@ Worker 命令通过 `--queues=${CELERY_TASK_DEFAULT_QUEUE}` 限制只消费主�
 
 - 这只是 DLQ 拓扑配置第一版。
 - `/metrics` 已经能观察主执行队列和 DLQ 的消息数、ready 数、unacked 数和消费者数。
-- 还没有实现 DLQ 消费者、DLQ 消息查询 API 或真实死信流转验证。
+- 已经实现 DLQ 查询 API 第一版，但还没有实现 DLQ 消费者、消息重放或真实死信流转验证。

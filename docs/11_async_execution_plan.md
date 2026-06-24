@@ -909,5 +909,58 @@ uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"}
 当前边界：
 
 - 这仍然是观测能力，不是 DLQ 消费能力。
-- 还没有实现 DLQ 消息查询 API，也没有从 RabbitMQ 拉取单条死信消息的安全流程。
+- 已经实现 DLQ 消息查询 API 第一版，但还没有 DLQ 消费者或重放流程。
 - 真正验证消息进入 DLQ 还需要容器环境下构造 reject/nack 场景，不能只靠单元测试证明。
+
+## 21. DLQ 查询 API 第一版
+
+DLQ 查询 API 的目标是排查问题，而不是处理问题。因此当前版本只做安全查看：
+
+```text
+GET /api/v1/dead-letter-queue
+-> 读取 uav_dag_execution.dlq 的队列状态
+
+GET /api/v1/dead-letter-queue/messages
+-> RabbitMQ Management API /queues/{vhost}/{queue}/get
+-> ackmode=ack_requeue_true
+-> 返回 payload / properties / headers
+```
+
+`ack_requeue_true` 是当前实现的核心约束：查询接口会短暂取出消息，但要求 RabbitMQ 重新放回队列，避免“看一眼就丢消息”。
+
+请求参数：
+
+```text
+limit:    1-100，默认 10
+truncate: 1-100000，默认 4096
+```
+
+返回信息：
+
+```text
+queue_name
+enabled
+available
+items[]
+  payload
+  payload_encoding
+  exchange
+  routing_key
+  redelivered
+  message_count
+  properties
+  headers
+```
+
+关键点：
+
+- 队列状态查询复用 `RabbitMQQueueMonitoringService`，避免重复实现 messages/consumers 解析逻辑。
+- 消息 peek 独立在 `RabbitMQDeadLetterQueueService`，因为它是 POST `/get`，语义和普通 queue snapshot 不同。
+- API 层限制 `limit` 和 `truncate`，避免一次性把大量死信消息或超大 payload 拉进 API 进程。
+- RabbitMQ 不可达时返回 `available=false` 和 `error_message`，不把运维查询失败伪装成业务异常。
+
+当前边界：
+
+- 还没有实现 DLQ 消费者。
+- 还没有实现把 DLQ 消息安全重放回主执行队列。
+- 真实消息能否进入 DLQ 仍取决于 Celery ack/reject 行为，需要 Docker 环境验证。

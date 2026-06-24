@@ -60,7 +60,7 @@ class RabbitMQQueueMonitoringService:
         request.add_header("Accept", "application/json")
         request.add_header(
             "Authorization",
-            _basic_auth_header(
+            build_basic_auth_header(
                 self.settings.rabbitmq_management_username,
                 self.settings.rabbitmq_management_password,
             ),
@@ -104,7 +104,7 @@ def _int_value(payload: dict[str, object], key: str) -> int:
     return 0
 
 
-def _basic_auth_header(username: str, password: str) -> str:
+def build_basic_auth_header(username: str, password: str) -> str:
     import base64
 
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
