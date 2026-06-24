@@ -23,7 +23,12 @@ class RabbitMQQueueMonitoringService:
         self.settings = settings or get_settings()
 
     def load_snapshot(self) -> QueueMonitoringSnapshot:
-        queue_name = self.settings.celery_task_default_queue
+        return self._load_snapshot(self.settings.celery_task_default_queue)
+
+    def load_snapshots(self) -> list[QueueMonitoringSnapshot]:
+        return [self._load_snapshot(queue_name) for queue_name in self._queue_names()]
+
+    def _load_snapshot(self, queue_name: str) -> QueueMonitoringSnapshot:
         if not self.settings.rabbitmq_queue_monitoring_enabled:
             return _empty_snapshot(queue_name, enabled=False)
 
@@ -41,6 +46,13 @@ class RabbitMQQueueMonitoringService:
             messages_unacknowledged=_int_value(payload, "messages_unacknowledged"),
             consumers=_int_value(payload, "consumers"),
         )
+
+    def _queue_names(self) -> list[str]:
+        queue_names = [
+            self.settings.celery_task_default_queue,
+            self.settings.celery_task_dead_letter_queue,
+        ]
+        return list(dict.fromkeys(queue_names))
 
     def _fetch_queue_payload(self, queue_name: str) -> dict[str, object]:
         url = self._queue_url(queue_name)

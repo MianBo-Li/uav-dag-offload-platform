@@ -553,6 +553,7 @@ Grafana dashboard 已增加：
 ```text
 Queue Messages
 Queue Consumers
+Worker Alerts
 ```
 
 当前边界：
@@ -762,3 +763,151 @@ TaskService.cancel_task()
 
 - 审计表先只落库，还没有查询 API。
 - 审计事件仍受当前事务影响；如果后续要进一步保证外部副作用和数据库记录一致，需要结合 outbox pattern。
+
+## 18. Celery 重试耗尽告警
+
+Celery 自动重试处理的是 Worker/数据库/网络这类临时基础设施异常。但重试预算用完后，系统不能只把异常写到日志里，还应该留下结构化告警：
+
+```text
+execute_subtask()
+-> retryable infrastructure exception
+-> if request.retries < celery_execution_max_retries
+-> self.retry(...)
+-> else
+-> worker_alerts 写入 CELERY_RETRY_EXHAUSTED
+-> raise original exception
+```
+
+当前版本新增 `worker_alerts` 表，并通过 `/metrics` 暴露：
+
+```text
+uav_dag_worker_alerts_total{alert_type="CELERY_RETRY_EXHAUSTED"} 1
+```
+
+同时提供运维查询接口：
+
+```text
+GET /api/v1/worker-alerts
+GET /api/v1/worker-alerts?alert_type=CELERY_RETRY_EXHAUSTED&severity=ERROR
+```
+
+关键点：
+
+- `has_worker_retry_budget()` 把“是否还能重试”的判断从任务函数里拆出来，方便测试。
+- `WorkerAlertService.report_retry_exhausted()` 记录 execution id、Celery task id、worker 名称、重试次数、异常类型和异常消息。
+- 告警写入是 best-effort：写告警失败不能盖掉原始 Worker 异常。
+- `WorkerAlertService.list_alerts()` 为 API 提供分页和过滤查询。
+- Grafana `Worker Alerts` 面板展示 `sum(uav_dag_worker_alerts_total)`，0 为绿色，出现告警后变红。
+- 当前先做应用层告警，RabbitMQ DLQ 仍作为下一步单独实现。
+
+当前边界：
+
+- 这不是 RabbitMQ 原生死信队列；真正 DLQ 还需要交换机、队列参数和容器环境验证。
+
+## 19. RabbitMQ DLQ 配置第一版
+
+RabbitMQ DLQ 的核心不是“任务失败后写一条业务告警”，而是消息层的死信路由：
+
+```text
+main queue
+-> x-dead-letter-exchange
+-> x-dead-letter-routing-key
+-> dead-letter exchange
+-> dead-letter queue
+```
+
+当前版本先完成 Celery 主执行队列的死信参数配置：
+
+```text
+Queue(name="uav_dag_execution")
+-> exchange="uav_dag_execution"
+-> routing_key="uav_dag_execution"
+-> queue_arguments:
+   x-dead-letter-exchange="uav_dag_execution.dlx"
+   x-dead-letter-routing-key="uav_dag_execution.dead"
+```
+
+Worker 启动后会通过 Kombu 尽力声明 DLQ 拓扑：
+
+```text
+worker_ready signal
+-> declare_dead_letter_topology()
+-> Exchange("uav_dag_execution.dlx").declare()
+-> Queue("uav_dag_execution.dlq", routing_key="uav_dag_execution.dead").declare()
+```
+
+同时 Docker worker 启动命令限定：
+
+```text
+--queues=${CELERY_TASK_DEFAULT_QUEUE}
+```
+
+也就是 Worker 只消费主执行队列，不默认消费 DLQ。
+
+涉及配置：
+
+```text
+CELERY_TASK_DEFAULT_QUEUE
+CELERY_TASK_DEFAULT_EXCHANGE
+CELERY_TASK_DEFAULT_ROUTING_KEY
+CELERY_TASK_DEAD_LETTER_EXCHANGE
+CELERY_TASK_DEAD_LETTER_ROUTING_KEY
+CELERY_TASK_DEAD_LETTER_QUEUE
+```
+
+关键点：
+
+- `build_execution_queue()` 把 Celery Queue 声明独立出来，便于测试。
+- `task_queues` 只包含主执行队列，避免 Worker 误消费 DLQ 队列。
+- `declare_dead_letter_topology()` 在 Worker ready 后声明 dead-letter exchange 和 dead-letter queue。
+- 当前应用层 `worker_alerts` 仍用于记录“重试耗尽”这类业务可理解告警。
+
+当前边界：
+
+- 还没有 DLQ 消费者，也没有 DLQ 消息查询 API。
+- Celery 普通任务失败是否进入 RabbitMQ DLQ，取决于 ack/reject 行为，不能只靠配置推断。
+
+## 20. DLQ 监控指标第一版
+
+DLQ 拓扑配置完成后，下一步不是马上写消费者，而是先让系统能观察 DLQ 是否出现堆积：
+
+```text
+RabbitMQ Management API
+-> /queues/{vhost}/uav_dag_execution
+-> /queues/{vhost}/uav_dag_execution.dlq
+-> QueueMonitoringSnapshot[]
+-> /metrics
+-> Grafana DLQ Ready Messages
+```
+
+当前版本把 `RabbitMQQueueMonitoringService.load_snapshot()` 保留为兼容主队列的单队列接口，同时新增 `load_snapshots()` 返回主执行队列和死信队列两个快照。
+
+`/metrics` 中同一组队列指标现在会按 `queue` 标签同时暴露主队列和 DLQ：
+
+```text
+uav_dag_queue_monitor_enabled{queue="uav_dag_execution"}
+uav_dag_queue_monitor_enabled{queue="uav_dag_execution.dlq"}
+uav_dag_queue_messages_ready{queue="uav_dag_execution"}
+uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"}
+uav_dag_queue_consumers{queue="uav_dag_execution"}
+uav_dag_queue_consumers{queue="uav_dag_execution.dlq"}
+```
+
+Grafana 新增 `DLQ Ready Messages` 面板，专门展示：
+
+```text
+uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"}
+```
+
+关键点：
+
+- 一个监控服务可以返回多个快照，Prometheus 渲染层再统一按标签展开。
+- `load_snapshot()` 继续存在，避免旧调用方被破坏。
+- DLQ 指标关注的是“有没有消息堆积”，不是“如何处理消息”。
+- `uav_dag_execution.dlq` 正常情况下应该长期为 0；一旦增长，就说明需要排查失败消息或死信路由。
+
+当前边界：
+
+- 这仍然是观测能力，不是 DLQ 消费能力。
+- 还没有实现 DLQ 消息查询 API，也没有从 RabbitMQ 拉取单条死信消息的安全流程。
+- 真正验证消息进入 DLQ 还需要容器环境下构造 reject/nack 场景，不能只靠单元测试证明。

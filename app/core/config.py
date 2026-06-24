@@ -13,6 +13,11 @@ class Settings(BaseSettings):
     celery_broker_url: str = "amqp://guest:guest@localhost:5672//"
     celery_result_backend: str = "redis://localhost:6379/1"
     celery_task_default_queue: str = "uav_dag_execution"
+    celery_task_default_exchange: str = "uav_dag_execution"
+    celery_task_default_routing_key: str = "uav_dag_execution"
+    celery_task_dead_letter_exchange: str = "uav_dag_execution.dlx"
+    celery_task_dead_letter_routing_key: str = "uav_dag_execution.dead"
+    celery_task_dead_letter_queue: str = "uav_dag_execution.dlq"
     celery_execution_max_retries: int = 3
     celery_execution_retry_backoff_seconds: int = 5
     celery_execution_retry_backoff_max_seconds: int = 60
