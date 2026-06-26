@@ -909,5 +909,150 @@ uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"}
 当前边界：
 
 - 这仍然是观测能力，不是 DLQ 消费能力。
-- 还没有实现 DLQ 消息查询 API，也没有从 RabbitMQ 拉取单条死信消息的安全流程。
+- 已经实现 DLQ 消息查询 API 第一版，但还没有 DLQ 消费者或重放流程。
 - 真正验证消息进入 DLQ 还需要容器环境下构造 reject/nack 场景，不能只靠单元测试证明。
+
+## 21. DLQ 查询 API 第一版
+
+DLQ 查询 API 的目标是排查问题，而不是处理问题。因此当前版本只做安全查看：
+
+```text
+GET /api/v1/dead-letter-queue
+-> 读取 uav_dag_execution.dlq 的队列状态
+
+GET /api/v1/dead-letter-queue/messages
+-> RabbitMQ Management API /queues/{vhost}/{queue}/get
+-> ackmode=ack_requeue_true
+-> 返回 payload / properties / headers
+```
+
+`ack_requeue_true` 是当前实现的核心约束：查询接口会短暂取出消息，但要求 RabbitMQ 重新放回队列，避免“看一眼就丢消息”。
+
+请求参数：
+
+```text
+limit:    1-100，默认 10
+truncate: 1-100000，默认 4096
+```
+
+返回信息：
+
+```text
+queue_name
+enabled
+available
+items[]
+  payload
+  payload_encoding
+  exchange
+  routing_key
+  redelivered
+  message_count
+  properties
+  headers
+```
+
+关键点：
+
+- 队列状态查询复用 `RabbitMQQueueMonitoringService`，避免重复实现 messages/consumers 解析逻辑。
+- 消息 peek 独立在 `RabbitMQDeadLetterQueueService`，因为它是 POST `/get`，语义和普通 queue snapshot 不同。
+- API 层限制 `limit` 和 `truncate`，避免一次性把大量死信消息或超大 payload 拉进 API 进程。
+- RabbitMQ 不可达时返回 `available=false` 和 `error_message`，不把运维查询失败伪装成业务异常。
+
+当前边界：
+
+- 还没有实现 DLQ 消费者。
+- 还没有实现把 DLQ 消息安全重放回主执行队列。
+- 真实消息能否进入 DLQ 仍取决于 Celery ack/reject 行为，需要 Docker 环境验证。
+
+## 22. DLQ 流转验证脚本
+
+为了验证 RabbitMQ 运行时真的能把 rejected 消息送入 DLQ，当前新增脚本：
+
+```text
+scripts/verify_dlq_flow.py
+```
+
+运行命令：
+
+```text
+.\.venv\Scripts\python.exe scripts\verify_dlq_flow.py
+```
+
+脚本不是从主业务队列里拿真实 execution 消息，而是创建临时 probe queue：
+
+```text
+检查主队列 dead-letter 参数
+-> 声明临时 probe queue，配置同一套 DLX 参数
+-> 绑定 probe queue 到主 exchange 的唯一 routing key
+-> 发布 probe 消息
+-> 从 probe queue 以 reject_requeue_false 取出消息
+-> RabbitMQ 触发 dead-letter routing
+-> 从真实 DLQ 以 ack_requeue_true 安全查看 probe 消息
+-> 删除临时 probe queue
+```
+
+关键 ack mode：
+
+```text
+reject_requeue_false  触发死信流转
+ack_requeue_true      安全查看 DLQ，不删除消息
+```
+
+成功输出中应看到：
+
+```text
+main_queue_dead_letter_configured: true
+published: true
+rejected: true
+found_in_dlq: true
+```
+
+2026-06-24 容器级实跑结果：
+
+```text
+main_queue_dead_letter_configured: true
+published: true
+rejected: true
+found_in_dlq: true
+dlq_message_count: 3
+```
+
+同时验证：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> headers.x-first-death-reason = rejected
+-> headers.x-first-death-exchange = uav_dag_execution
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
+本次实跑发现并处理了旧拓扑迁移问题：
+
+```text
+旧队列 uav_dag_execution 已存在，arguments={}
+新 Worker 声明同名队列时带 dead-letter 参数
+RabbitMQ 返回 PRECONDITION_FAILED
+```
+
+RabbitMQ 不允许原地改变已有队列的关键 arguments。开发环境中的处理方式是：
+
+```text
+确认主队列 messages=0
+-> 停止 worker
+-> 删除旧主队列
+-> rebuild api/worker 镜像
+-> 启动 worker
+-> 新队列带 x-dead-letter-exchange / x-dead-letter-routing-key
+```
+
+当前边界：
+
+- 容器级 DLQ 流转已经验证通过。
+- 脚本会保留 probe 消息在真实 DLQ 中，作为流转证据。
+- 这仍然不是 DLQ 消费者，也没有实现死信重放。

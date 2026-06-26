@@ -81,10 +81,7 @@ services:
       WORKER_HEARTBEAT_TIMEOUT_SECONDS: "60"
       DEFAULT_SCHEDULER_STRATEGY: greedy
     command: >
-      sh -c "celery -A app.worker.celery_app:celery_app worker
-             --loglevel=INFO
-             --concurrency=1
-             --queues=$${CELERY_TASK_DEFAULT_QUEUE}"
+      sh -c "celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=1 --queues=$${CELERY_TASK_DEFAULT_QUEUE}"
     depends_on:
       postgres:
         condition: service_healthy

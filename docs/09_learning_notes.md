@@ -2101,23 +2101,215 @@ Grafana: dashboard JSON 结构校验
 
 当前边界：
 
-- 还没有 DLQ 消费者、DLQ 消息查询 API 或真实死信流转验证。
+- 已经补上 DLQ 查询 API 第一版，但还没有 DLQ 消费者或真实死信流转验证。
 - 当前测试能证明指标渲染和 RabbitMQ Management API 调用逻辑，不能证明 Celery 失败消息一定会进入 DLQ。
 - 下一步应该在容器环境构造可控的 reject/nack 场景，验证 RabbitMQ DLQ 的真实行为。
+
+### 6.38 DLQ 查询 API 第一版
+
+日期：2026-06-24
+
+目标：
+
+```text
+提供一个安全的 DLQ 查询入口，
+既能查看 DLQ 当前队列状态，
+也能 peek 少量死信消息而不真正消费它们。
+```
+
+为什么要做：
+
+- 只有指标能看到“有几条消息”，但排查问题时还需要知道消息大致内容和 RabbitMQ headers。
+- DLQ 消息通常代表异常场景，查询接口不能因为“看一下”就把消息删掉。
+- RabbitMQ Management API 的 `/get` 支持不同 ack mode，当前必须固定使用 `ack_requeue_true`。
+
+涉及文件：
+
+- [app/services/dead_letter_queue_service.py](../app/services/dead_letter_queue_service.py)
+- [app/api/v1/endpoints/dead_letter_queue.py](../app/api/v1/endpoints/dead_letter_queue.py)
+- [app/schemas/dead_letter_queue.py](../app/schemas/dead_letter_queue.py)
+- [app/api/v1/router.py](../app/api/v1/router.py)
+- [tests/services/test_dead_letter_queue_service.py](../tests/services/test_dead_letter_queue_service.py)
+- [tests/api/test_dead_letter_queue.py](../tests/api/test_dead_letter_queue.py)
+
+新增接口：
+
+```text
+GET /api/v1/dead-letter-queue
+GET /api/v1/dead-letter-queue/messages?limit=10&truncate=4096
+```
+
+关键实现：
+
+```text
+RabbitMQDeadLetterQueueService.peek_messages()
+-> POST /api/queues/{vhost}/{queue}/get
+-> ackmode = ack_requeue_true
+-> encoding = auto
+-> truncate = 4096
+-> 返回 payload / properties / headers / message_count
+```
+
+学到的知识：
+
+- “查询队列消息”本身也可能改变队列状态，所以必须明确 ack mode。
+- `ack_requeue_true` 适合做安全查看：RabbitMQ 会把取出的消息重新放回队列。
+- API 层只做参数校验和响应组装，RabbitMQ 调用细节放在 Service 层。
+- DLQ 查询 API 适合限制 `limit` 和 `truncate`，避免一次性拉出过多或过大的消息。
+
+测试覆盖：
+
+```text
+Service: 监控关闭时不访问 RabbitMQ，返回 enabled=false
+Service: peek 请求使用 ack_requeue_true / encoding=auto / truncate
+Service: RabbitMQ 不可达时返回 available=false
+API: GET /dead-letter-queue 返回 DLQ snapshot
+API: GET /dead-letter-queue/messages 返回消息 payload 和 headers
+```
+
+当前边界：
+
+- 这仍然不是 DLQ 消费者，不会确认、删除或重放死信消息。
+- 当前 API 只做安全 peek，没有实现“重新入主队列”“标记已处理”等运维动作。
+- 真实死信流转还需要在 Docker/RabbitMQ 环境里构造 reject/nack 场景验证。
+
+### 6.39 DLQ 真实流转验证脚本
+
+日期：2026-06-24
+
+目标：
+
+```text
+把“RabbitMQ DLQ 配置是否真的能流转消息”做成可重复运行的验证脚本，
+避免每次都手工进入 RabbitMQ UI 操作。
+```
+
+为什么要做：
+
+- 单元测试能证明队列参数被声明，但不能证明 RabbitMQ 运行时真的会把 rejected 消息送进 DLQ。
+- 直接从主业务队列取消息再 reject 有误伤正常任务的风险。
+- 使用临时 probe queue 可以验证 DLX 和真实 DLQ 路由，同时不消费主业务队列里的正常任务。
+
+涉及文件：
+
+- [app/services/dead_letter_flow_verifier.py](../app/services/dead_letter_flow_verifier.py)
+- [scripts/verify_dlq_flow.py](../scripts/verify_dlq_flow.py)
+- [tests/services/test_dead_letter_flow_verifier.py](../tests/services/test_dead_letter_flow_verifier.py)
+- [10_docker_compose.md](10_docker_compose.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+验证流程：
+
+```text
+GET main queue
+-> 检查 x-dead-letter-exchange / x-dead-letter-routing-key
+-> PUT 临时 probe queue，配置同一套 DLX 参数
+-> POST binding，把 probe queue 绑定到主 exchange 的唯一 routing key
+-> POST publish，发布 probe 消息
+-> POST probe queue /get，ackmode=reject_requeue_false
+-> POST DLQ /get，ackmode=ack_requeue_true
+-> 查找 probe_id
+-> DELETE 临时 probe queue
+```
+
+运行命令：
+
+```text
+.\.venv\Scripts\python.exe scripts\verify_dlq_flow.py
+```
+
+脚本成功时会输出：
+
+```json
+{
+  "main_queue_dead_letter_configured": true,
+  "published": true,
+  "rejected": true,
+  "found_in_dlq": true
+}
+```
+
+学到的知识：
+
+- RabbitMQ 死信流转的核心触发条件之一是 reject/nack 且 `requeue=false`。
+- 验证脚本要尽量避免碰业务队列中的真实消息，临时队列是更安全的探针做法。
+- `reject_requeue_false` 用来触发死信；`ack_requeue_true` 用来安全查看 DLQ。
+- 运行时验证和单元测试互补：前者验证真实 RabbitMQ 行为，后者验证请求构造和流程控制。
+
+测试覆盖：
+
+```text
+Service: 验证主队列 dead-letter 参数检查
+Service: 验证 publish probe 消息
+Service: 验证 probe queue 使用 reject_requeue_false
+Service: 验证 DLQ peek 使用 ack_requeue_true
+Script: py_compile 语法检查
+```
+
+Docker 实跑结果：
+
+```json
+{
+  "main_queue_dead_letter_configured": true,
+  "published": true,
+  "rejected": true,
+  "found_in_dlq": true,
+  "dlq_message_count": 3,
+  "error_message": null
+}
+```
+
+同时通过 API 验证：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> headers.x-first-death-reason = rejected
+-> headers.x-first-death-exchange = uav_dag_execution
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
+这次实跑还暴露了一个很真实的运维问题：
+
+```text
+旧 RabbitMQ 队列 uav_dag_execution 已经存在，arguments={}
+新 Worker 声明同名队列时带 x-dead-letter-exchange
+RabbitMQ 返回 PRECONDITION_FAILED
+```
+
+处理方式：
+
+```text
+确认主队列 messages=0
+-> 停止 worker
+-> 删除旧的空主队列
+-> rebuild api/worker 镜像
+-> 启动 worker
+-> 新队列 arguments 带上 x-dead-letter-exchange / x-dead-letter-routing-key
+```
+
+当前边界：
+
+- 容器级 DLQ 流转已经验证通过。
+- 脚本会把探针消息留在真实 DLQ 中用于证明流转，可通过 DLQ 查询 API 观察。
+- 这仍然不是 DLQ 消费者，也没有实现消息重放。
 
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，能记录 revoke 事件审计，新增了 Celery 重试耗尽告警第一版、告警查询 API 和 Grafana Worker Alerts 面板，并为 Celery 主执行队列配置了 RabbitMQ DLQ 路由参数和 DLQ 拓扑声明，同时把 DLQ 消息数接入了 /metrics 和 Grafana。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，能记录 revoke 事件审计，新增了 Celery 重试耗尽告警第一版、告警查询 API 和 Grafana Worker Alerts 面板，并为 Celery 主执行队列配置了 RabbitMQ DLQ 路由参数和 DLQ 拓扑声明，同时把 DLQ 消息数接入了 /metrics 和 Grafana，补上了安全 peek 的 DLQ 查询 API 第一版，新增了可重复运行的 DLQ 流转验证脚本，并已经完成 Docker/RabbitMQ 容器级实跑验证。
 ```
 
 尚未完成：
 
 ```text
 独立周期性 Worker 心跳
-RabbitMQ DLQ 消费验证和查询 API
 Grafana Alerting 规则
 outbox pattern
 ```
@@ -2128,7 +2320,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把 Worker 周期性取消检查、revoke 事件审计、Celery 重试耗尽告警、告警查询 API、Grafana 面板、DLQ 配置和 DLQ 监控第一版整理成一次阶段性提交。
+也就是把 Worker 周期性取消检查、revoke 事件审计、Celery 重试耗尽告警、告警查询 API、Grafana 面板、DLQ 配置、DLQ 监控、DLQ 查询 API 和 DLQ 流转验证脚本整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 
