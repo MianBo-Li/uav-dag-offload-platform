@@ -17,6 +17,15 @@ class WorkerStatus(StrEnum):
     BUSY = "BUSY"
 
 
+class WorkerAlertType(StrEnum):
+    CELERY_RETRY_EXHAUSTED = "CELERY_RETRY_EXHAUSTED"
+
+
+class AlertSeverity(StrEnum):
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+
 class TaskStatus(StrEnum):
     PENDING = "PENDING"
     SCHEDULED = "SCHEDULED"

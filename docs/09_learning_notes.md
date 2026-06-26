@@ -1093,7 +1093,7 @@ api:8000/metrics
 ```
 
 - Grafana 通过 provisioning 自动创建 Prometheus 数据源和 dashboard，避免每次手动配置。
-- 当前 dashboard 展示节点数、任务数、执行记录数、执行耗时总和、任务状态分布、执行状态分布和节点类型分布。
+- 当前 dashboard 展示节点数、任务数、执行记录数、执行耗时总和、任务状态分布、执行状态分布、节点类型分布、队列消息、队列消费者、Worker 心跳和 Worker 告警。
 
 当前验证：
 
@@ -1729,33 +1729,588 @@ docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
 当前边界：
 
 - 当前使用 `terminate=False`，不会强制杀掉已经开始运行的 Python 代码。
-- 如果任务已经被 Worker 取走并正在执行，仍然需要 Worker 自己周期性检查数据库取消状态。
+- 如果任务已经被 Worker 取走并正在执行，当前已经通过 Worker 周期性取消检查做协作式提前退出。
 - 还没有把 revoke 成功/失败写入审计表或事件表。
 - outbox pattern 仍未实现，因此“数据库提交成功但 Celery 投递失败”的一致性问题还没有最终解决。
 
 下一步：
 
 ```text
-Worker 周期性检查 execution_record 是否已取消
--> revoke 事件审计
--> 死信队列和重试耗尽告警
+死信队列和重试耗尽告警
 -> outbox pattern
 ```
+
+### 6.33 Worker 周期性取消检查
+
+日期：2026-06-23
+
+目标：
+
+```text
+让已经进入 Worker 代码的模拟执行任务，
+也能在执行过程中周期性发现数据库里的取消状态，
+从而比“等 sleep 结束再被 accepted=false 拒绝”更早退出。
+```
+
+为什么要做：
+
+- `revoke(terminate=False)` 对尚未开始执行的 Celery 消息有效，但不能立刻停止已经运行中的 Python 代码。
+- 只依赖最终回传时的 `accepted=false` 虽然安全，但 Worker 仍会白白等待完整模拟耗时。
+- 协作式取消更符合真实工程：让执行逻辑主动检查取消信号，而不是强杀进程。
+
+涉及文件：
+
+- [app/core/config.py](../app/core/config.py)
+- [app/worker/tasks.py](../app/worker/tasks.py)
+- [tests/worker/test_task_retry.py](../tests/worker/test_task_retry.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+execute_subtask()
+-> report_worker_heartbeat(BUSY)
+-> sleep_with_cancel_checks(...)
+-> is_execution_canceled(execution_id)
+-> 如果 execution_record.status == CANCELED
+-> 提前 report_result(CANCELED)
+-> report_result 发现记录已非 RUNNING，返回 accepted=false
+-> report_worker_heartbeat(ONLINE)
+```
+
+学到的知识：
+
+- 分布式任务取消通常分两层：消息层 revoke 负责“尽量不开始”，业务层取消检查负责“开始后尽早停”。
+- `terminate=False` 是安全选择，但它不是强制停止机制。
+- 长耗时逻辑如果写成一次性 `sleep()` 或一个大循环，就很难响应取消；要把执行拆成可检查的小片段。
+- 可测试性来自依赖注入：`sleep_with_cancel_checks()` 注入 `sleep_fn` 和 `cancel_check_fn`，测试就不用真的等时间流逝。
+- 即使 Worker 主动发现取消，也不应该绕过统一的 `ExecutionService.report_result()`，否则容易破坏幂等和状态机约束。
+
+测试覆盖：
+
+```text
+Worker: 已取消时不进入 sleep，立即返回取消
+Worker: 长 sleep 会按检查间隔分片，并在发现取消后提前停止
+```
+
+验证结果：
+
+```text
+pytest tests/worker/test_task_retry.py: 8 passed
+ruff targeted: All checks passed
+```
+
+当前边界：
+
+- 这次只覆盖模拟执行 sleep；真实执行外部命令、长 CPU 计算或网络调用时，还需要在真实执行步骤中放置取消检查点。
+- 轮询间隔越短，响应越快，但数据库查询越频繁，需要在真实负载下调参。
+
+### 6.34 revoke 事件审计
+
+日期：2026-06-23
+
+目标：
+
+```text
+取消运行中任务时，
+如果系统对 celery_task_id 发出 revoke，
+就把这次 revoke 尝试记录到数据库审计表中。
+```
+
+为什么要做：
+
+- 之前 `ExecutionRevoker.revoke()` 只返回成功/失败，取消完成后很难追踪“到底撤销了哪条 Celery 消息”。
+- 分布式系统排查问题时，状态表只能说明当前事实，事件表能说明“发生过什么”。
+- revoke 失败不应该阻断业务取消，但失败事实应该被保存，方便后续告警和诊断。
+
+涉及文件：
+
+- [app/db/models/task.py](../app/db/models/task.py)
+- [app/db/models/__init__.py](../app/db/models/__init__.py)
+- [app/repositories/revoke_event_repository.py](../app/repositories/revoke_event_repository.py)
+- [app/services/task_service.py](../app/services/task_service.py)
+- [alembic/versions/20260623_0009_create_execution_revoke_events.py](../alembic/versions/20260623_0009_create_execution_revoke_events.py)
+- [tests/services/test_execution_service.py](../tests/services/test_execution_service.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+TaskService.cancel_task()
+-> _cancel_running_executions()
+-> execution_record.status = CANCELED
+-> ExecutionRevoker.revoke(celery_task_id)
+-> RevokeEventRepository.create(...)
+-> execution_revoke_events 写入 success / error_message
+```
+
+学到的知识：
+
+- 审计表和状态表用途不同：状态表回答“现在是什么”，审计表回答“之前发生了什么”。
+- 外部系统调用结果最好落库，否则只靠日志很难做 API 查询、告警和长期分析。
+- revoke 失败不应阻断取消主流程，因为业务取消的数据库事实更重要。
+- 把审计写入同一事务，能保证“任务被取消”和“系统尝试过 revoke”一起提交；但外部副作用和事务之间仍有一致性边界。
+
+测试覆盖：
+
+```text
+Service: cancel_task() revoke 成功时写 success=true 的审计事件
+Service: revoke 返回 false 时写 success=false 和错误信息
+```
+
+验证结果：
+
+```text
+pytest tests/services/test_execution_service.py: 4 passed
+ruff app tests alembic: All checks passed
+alembic heads: 20260623_0009 (head)
+```
+
+当前边界：
+
+- 审计表暂时没有查询 API，后续可以加 `/tasks/{task_id}/revoke-events` 或运维查询接口。
+- 如果未来要保证“数据库提交后一定发送 revoke”或“发送 revoke 后一定记录事件”，需要引入 outbox pattern。
+
+### 6.35 Celery 重试耗尽告警第一版
+
+日期：2026-06-23
+
+目标：
+
+```text
+当 Celery Worker 因基础设施异常反复 retry，
+并且 retry 预算已经耗尽时，
+把这件事写入 worker_alerts 表，
+同时暴露到 /metrics。
+```
+
+为什么要做：
+
+- 之前 Worker 会按指数退避重试数据库临时异常，但重试用完后只会抛异常和写日志。
+- 日志适合排查单次问题，告警表适合长期查询、统计和接入 Prometheus。
+- “重试耗尽”是系统稳定性信号，应该变成可观测事实。
+
+涉及文件：
+
+- [app/domain/enums.py](../app/domain/enums.py)
+- [app/db/models/worker.py](../app/db/models/worker.py)
+- [app/db/models/__init__.py](../app/db/models/__init__.py)
+- [app/repositories/worker_alert_repository.py](../app/repositories/worker_alert_repository.py)
+- [app/services/worker_alert_service.py](../app/services/worker_alert_service.py)
+- [app/services/monitoring_service.py](../app/services/monitoring_service.py)
+- [app/worker/tasks.py](../app/worker/tasks.py)
+- [app/schemas/worker_alert.py](../app/schemas/worker_alert.py)
+- [app/api/v1/endpoints/worker_alerts.py](../app/api/v1/endpoints/worker_alerts.py)
+- [monitoring/grafana/dashboards/uav-dag-overview.json](../monitoring/grafana/dashboards/uav-dag-overview.json)
+- [alembic/versions/20260623_0010_create_worker_alerts.py](../alembic/versions/20260623_0010_create_worker_alerts.py)
+- [tests/worker/test_task_retry.py](../tests/worker/test_task_retry.py)
+- [tests/services/test_worker_alert_service.py](../tests/services/test_worker_alert_service.py)
+- [tests/api/test_monitoring.py](../tests/api/test_monitoring.py)
+- [tests/api/test_worker_alerts.py](../tests/api/test_worker_alerts.py)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+execute_subtask()
+-> 捕获 retryable worker exception
+-> has_worker_retry_budget(self.request.retries, max_retries)
+-> 有预算：self.retry(...)
+-> 无预算：report_retry_exhausted_alert(...)
+-> worker_alerts 写入 CELERY_RETRY_EXHAUSTED
+-> /metrics 输出 uav_dag_worker_alerts_total
+-> GET /api/v1/worker-alerts 查询告警明细
+-> Grafana Worker Alerts 面板展示告警总数
+```
+
+学到的知识：
+
+- 重试不是无限兜底，重试耗尽本身就是一个需要被观测的事件。
+- 告警写入不应遮蔽原始异常，所以这里用 best-effort：告警失败只写日志，原异常继续抛出。
+- 应用层告警和 RabbitMQ 死信队列不是一回事：前者记录业务可理解的失败事实，后者记录消息层无法正常消费的消息。
+- 把 retry budget 判断拆成 `has_worker_retry_budget()`，可以避免只靠 Celery 黑盒行为测试。
+- 查询 API 让告警从“只能看数据库”变成“运维和前端都能消费的资源”。
+- Grafana 面板适合看整体健康信号，API 适合追具体告警明细，两者互补。
+
+测试覆盖：
+
+```text
+Worker: has_worker_retry_budget() 在达到 max_retries 后返回 false
+Service: report_retry_exhausted() 能创建 worker_alerts 记录
+Service: load_snapshot() 能按 alert_type 聚合告警数量
+API: /metrics 暴露 uav_dag_worker_alerts_total
+API: /worker-alerts 支持分页和 alert_type / severity 过滤
+Grafana: Worker Alerts 面板 JSON 校验通过
+```
+
+验证结果：
+
+```text
+pytest worker retry / worker alert / monitoring subset: 17 passed
+ruff app tests alembic: All checks passed
+alembic heads: 20260623_0010 (head)
+```
+
+当前边界：
+
+- 已经为 Celery 主执行队列配置 dead-letter exchange / routing key，但还没有完整声明和消费 DLQ 队列。
+- Grafana 现在是展示面板，还没有配置真正的 Grafana Alerting 规则。
+
+### 6.36 RabbitMQ DLQ 拓扑配置第一版
+
+日期：2026-06-23
+
+目标：
+
+```text
+让 Celery 主执行队列在声明时带上 RabbitMQ dead-letter 参数，
+并在 Worker ready 后声明 dead-letter exchange / queue，
+为后续 DLQ 消费者和 DLQ 查询 API 做基础铺垫。
+```
+
+为什么要做：
+
+- 应用层 `worker_alerts` 能记录“重试耗尽”这种业务事实，但 RabbitMQ DLQ 关注的是“消息层不可正常消费”的消息。
+- 如果主队列没有 `x-dead-letter-exchange`，后续即使创建 DLQ，也没有死信路由入口。
+- 先把队列声明独立成 `build_execution_queue()`，可以不用启动 RabbitMQ 就测试 DLQ 参数是否正确。
+
+涉及文件：
+
+- [app/core/config.py](../app/core/config.py)
+- [app/worker/celery_app.py](../app/worker/celery_app.py)
+- [docker-compose.yml](../docker-compose.yml)
+- [tests/worker/test_celery_app_config.py](../tests/worker/test_celery_app_config.py)
+- [10_docker_compose.md](10_docker_compose.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+Settings
+-> celery_task_default_exchange
+-> celery_task_default_routing_key
+-> celery_task_dead_letter_exchange
+-> celery_task_dead_letter_routing_key
+-> celery_task_dead_letter_queue
+
+build_execution_queue(settings)
+-> Queue(...)
+-> queue_arguments:
+   x-dead-letter-exchange
+   x-dead-letter-routing-key
+
+worker_ready signal
+-> declare_dead_letter_topology(settings)
+-> 声明 dead-letter exchange
+-> 声明 dead-letter queue
+
+docker compose worker command
+-> --queues=${CELERY_TASK_DEFAULT_QUEUE}
+-> 只消费主执行队列，不消费 DLQ
+```
+
+学到的知识：
+
+- RabbitMQ DLQ 的基础是队列参数，不是业务代码里手动写一张失败表。
+- Celery 的 `task_queues` 如果把 DLQ 队列也放进去，Worker 可能误消费 DLQ，所以当前只声明主执行队列。
+- DLQ 拓扑声明适合放在 Worker ready 后做 best-effort 初始化，失败时写日志，避免影响主服务导入。
+- DLQ 配置和应用层告警互补：DLQ 看消息层，`worker_alerts` 看业务/Worker 层。
+- 即使 DLQ exchange / queue 已声明，也仍需要验证具体 Celery 失败场景是否会 reject 并进入 DLQ。
+
+测试覆盖：
+
+```text
+Worker: build_execution_queue() 声明 dead-letter exchange 和 routing key
+Worker: build_dead_letter_queue() 使用 dead-letter exchange 和 routing key
+Worker: celery_app.conf.task_queues 不包含 DLQ，避免默认消费
+```
+
+验证结果：
+
+```text
+pytest tests/worker/test_celery_app_config.py: 3 passed
+ruff targeted: All checks passed
+docker compose config --quiet: passed，带 Docker 凭证文件访问 warning
+```
+
+当前边界：
+
+- 已经有 DLQ metrics，但还没有 DLQ 消费者或 DLQ 查询 API。
+- Celery 普通异常最终是否会进入 DLQ，还需要结合 ack/reject 行为做容器环境验证。
+
+### 6.37 DLQ 监控指标第一版
+
+日期：2026-06-24
+
+目标：
+
+```text
+让 RabbitMQ 队列监控同时覆盖主执行队列和 DLQ，
+并通过 /metrics 与 Grafana 展示 DLQ 是否出现消息堆积。
+```
+
+为什么要做：
+
+- DLQ 拓扑配置完成后，需要先能看见 DLQ 的状态，再讨论如何消费或查询死信消息。
+- 正常情况下 `uav_dag_execution.dlq` 应该长期为 0；一旦增长，就说明失败消息开始堆积。
+- 监控主队列和 DLQ 使用同一套指标标签，比单独发明一组 DLQ 指标更容易扩展。
+
+涉及文件：
+
+- [app/services/queue_monitoring_service.py](../app/services/queue_monitoring_service.py)
+- [app/services/monitoring_service.py](../app/services/monitoring_service.py)
+- [monitoring/grafana/dashboards/uav-dag-overview.json](../monitoring/grafana/dashboards/uav-dag-overview.json)
+- [tests/services/test_queue_monitoring_service.py](../tests/services/test_queue_monitoring_service.py)
+- [tests/api/test_monitoring.py](../tests/api/test_monitoring.py)
+- [10_docker_compose.md](10_docker_compose.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+关键实现：
+
+```text
+RabbitMQQueueMonitoringService.load_snapshot()
+-> 保留单队列兼容接口
+
+RabbitMQQueueMonitoringService.load_snapshots()
+-> 返回 uav_dag_execution
+-> 返回 uav_dag_execution.dlq
+
+MonitoringService.render_prometheus_metrics()
+-> 按 queue 标签展开多个 QueueMonitoringSnapshot
+
+Grafana
+-> 新增 DLQ Ready Messages 面板
+```
+
+学到的知识：
+
+- Prometheus 指标更适合通过标签表达同类资源，而不是每个资源新建一套指标名。
+- 保留旧接口再新增批量接口，可以降低重构对调用方的影响。
+- DLQ 监控属于观测能力，不等于已经实现 DLQ 消费能力。
+- DLQ 消息数为 0 不是“没有问题”的充分证明，但消息数大于 0 一定值得排查。
+
+测试覆盖：
+
+```text
+QueueMonitoringService: 关闭监控时同时返回主队列和 DLQ 的 disabled snapshot
+QueueMonitoringService: 分别读取主队列和 DLQ 的 RabbitMQ Management API payload
+QueueMonitoringService: RabbitMQ 不可达时两个队列都返回 available=false
+/metrics: 暴露 uav_dag_execution 和 uav_dag_execution.dlq 两组 queue 标签
+Grafana: dashboard JSON 结构校验
+```
+
+当前边界：
+
+- 已经补上 DLQ 查询 API 第一版，但还没有 DLQ 消费者或真实死信流转验证。
+- 当前测试能证明指标渲染和 RabbitMQ Management API 调用逻辑，不能证明 Celery 失败消息一定会进入 DLQ。
+- 下一步应该在容器环境构造可控的 reject/nack 场景，验证 RabbitMQ DLQ 的真实行为。
+
+### 6.38 DLQ 查询 API 第一版
+
+日期：2026-06-24
+
+目标：
+
+```text
+提供一个安全的 DLQ 查询入口，
+既能查看 DLQ 当前队列状态，
+也能 peek 少量死信消息而不真正消费它们。
+```
+
+为什么要做：
+
+- 只有指标能看到“有几条消息”，但排查问题时还需要知道消息大致内容和 RabbitMQ headers。
+- DLQ 消息通常代表异常场景，查询接口不能因为“看一下”就把消息删掉。
+- RabbitMQ Management API 的 `/get` 支持不同 ack mode，当前必须固定使用 `ack_requeue_true`。
+
+涉及文件：
+
+- [app/services/dead_letter_queue_service.py](../app/services/dead_letter_queue_service.py)
+- [app/api/v1/endpoints/dead_letter_queue.py](../app/api/v1/endpoints/dead_letter_queue.py)
+- [app/schemas/dead_letter_queue.py](../app/schemas/dead_letter_queue.py)
+- [app/api/v1/router.py](../app/api/v1/router.py)
+- [tests/services/test_dead_letter_queue_service.py](../tests/services/test_dead_letter_queue_service.py)
+- [tests/api/test_dead_letter_queue.py](../tests/api/test_dead_letter_queue.py)
+
+新增接口：
+
+```text
+GET /api/v1/dead-letter-queue
+GET /api/v1/dead-letter-queue/messages?limit=10&truncate=4096
+```
+
+关键实现：
+
+```text
+RabbitMQDeadLetterQueueService.peek_messages()
+-> POST /api/queues/{vhost}/{queue}/get
+-> ackmode = ack_requeue_true
+-> encoding = auto
+-> truncate = 4096
+-> 返回 payload / properties / headers / message_count
+```
+
+学到的知识：
+
+- “查询队列消息”本身也可能改变队列状态，所以必须明确 ack mode。
+- `ack_requeue_true` 适合做安全查看：RabbitMQ 会把取出的消息重新放回队列。
+- API 层只做参数校验和响应组装，RabbitMQ 调用细节放在 Service 层。
+- DLQ 查询 API 适合限制 `limit` 和 `truncate`，避免一次性拉出过多或过大的消息。
+
+测试覆盖：
+
+```text
+Service: 监控关闭时不访问 RabbitMQ，返回 enabled=false
+Service: peek 请求使用 ack_requeue_true / encoding=auto / truncate
+Service: RabbitMQ 不可达时返回 available=false
+API: GET /dead-letter-queue 返回 DLQ snapshot
+API: GET /dead-letter-queue/messages 返回消息 payload 和 headers
+```
+
+当前边界：
+
+- 这仍然不是 DLQ 消费者，不会确认、删除或重放死信消息。
+- 当前 API 只做安全 peek，没有实现“重新入主队列”“标记已处理”等运维动作。
+- 真实死信流转还需要在 Docker/RabbitMQ 环境里构造 reject/nack 场景验证。
+
+### 6.39 DLQ 真实流转验证脚本
+
+日期：2026-06-24
+
+目标：
+
+```text
+把“RabbitMQ DLQ 配置是否真的能流转消息”做成可重复运行的验证脚本，
+避免每次都手工进入 RabbitMQ UI 操作。
+```
+
+为什么要做：
+
+- 单元测试能证明队列参数被声明，但不能证明 RabbitMQ 运行时真的会把 rejected 消息送进 DLQ。
+- 直接从主业务队列取消息再 reject 有误伤正常任务的风险。
+- 使用临时 probe queue 可以验证 DLX 和真实 DLQ 路由，同时不消费主业务队列里的正常任务。
+
+涉及文件：
+
+- [app/services/dead_letter_flow_verifier.py](../app/services/dead_letter_flow_verifier.py)
+- [scripts/verify_dlq_flow.py](../scripts/verify_dlq_flow.py)
+- [tests/services/test_dead_letter_flow_verifier.py](../tests/services/test_dead_letter_flow_verifier.py)
+- [10_docker_compose.md](10_docker_compose.md)
+- [11_async_execution_plan.md](11_async_execution_plan.md)
+
+验证流程：
+
+```text
+GET main queue
+-> 检查 x-dead-letter-exchange / x-dead-letter-routing-key
+-> PUT 临时 probe queue，配置同一套 DLX 参数
+-> POST binding，把 probe queue 绑定到主 exchange 的唯一 routing key
+-> POST publish，发布 probe 消息
+-> POST probe queue /get，ackmode=reject_requeue_false
+-> POST DLQ /get，ackmode=ack_requeue_true
+-> 查找 probe_id
+-> DELETE 临时 probe queue
+```
+
+运行命令：
+
+```text
+.\.venv\Scripts\python.exe scripts\verify_dlq_flow.py
+```
+
+脚本成功时会输出：
+
+```json
+{
+  "main_queue_dead_letter_configured": true,
+  "published": true,
+  "rejected": true,
+  "found_in_dlq": true
+}
+```
+
+学到的知识：
+
+- RabbitMQ 死信流转的核心触发条件之一是 reject/nack 且 `requeue=false`。
+- 验证脚本要尽量避免碰业务队列中的真实消息，临时队列是更安全的探针做法。
+- `reject_requeue_false` 用来触发死信；`ack_requeue_true` 用来安全查看 DLQ。
+- 运行时验证和单元测试互补：前者验证真实 RabbitMQ 行为，后者验证请求构造和流程控制。
+
+测试覆盖：
+
+```text
+Service: 验证主队列 dead-letter 参数检查
+Service: 验证 publish probe 消息
+Service: 验证 probe queue 使用 reject_requeue_false
+Service: 验证 DLQ peek 使用 ack_requeue_true
+Script: py_compile 语法检查
+```
+
+Docker 实跑结果：
+
+```json
+{
+  "main_queue_dead_letter_configured": true,
+  "published": true,
+  "rejected": true,
+  "found_in_dlq": true,
+  "dlq_message_count": 3,
+  "error_message": null
+}
+```
+
+同时通过 API 验证：
+
+```text
+GET /api/v1/dead-letter-queue
+-> messages_ready = 2
+
+GET /api/v1/dead-letter-queue/messages?limit=5&truncate=2048
+-> headers.x-first-death-reason = rejected
+-> headers.x-first-death-exchange = uav_dag_execution
+
+/metrics
+-> uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 2
+```
+
+这次实跑还暴露了一个很真实的运维问题：
+
+```text
+旧 RabbitMQ 队列 uav_dag_execution 已经存在，arguments={}
+新 Worker 声明同名队列时带 x-dead-letter-exchange
+RabbitMQ 返回 PRECONDITION_FAILED
+```
+
+处理方式：
+
+```text
+确认主队列 messages=0
+-> 停止 worker
+-> 删除旧的空主队列
+-> rebuild api/worker 镜像
+-> 启动 worker
+-> 新队列 arguments 带上 x-dead-letter-exchange / x-dead-letter-routing-key
+```
+
+当前边界：
+
+- 容器级 DLQ 流转已经验证通过。
+- 脚本会把探针消息留在真实 DLQ 中用于证明流转，可通过 DLQ 查询 API 观察。
+- 这仍然不是 DLQ 消费者，也没有实现消息重放。
 
 ## 8. 当前开发状态
 
 当前已经完成到：
 
 ```text
-调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，并支持保存 Celery task id 与安全 revoke。
+调度 API 已开放，调度计划可落库，任务可进入 SCHEDULED，可以查询调度计划列表和详情，可以启动模拟执行进入 RUNNING，可以回传执行结果推动子任务和总任务状态，可以查询任务下的执行记录，可以为后继 READY 子任务继续调度和执行，已经跑通 3 个子任务的 DAG 成功闭环，可以查询任务指标统计，已经补充 Docker Compose 本地开发环境配置、容器级启动验证、容器环境 API 冒烟流程、Prometheus 文本指标端点，可以对比 local_only、random_offload 和 greedy 三种调度策略，并且已经接入 Prometheus/Grafana 可视化。当前已经进一步接入 RabbitMQ 和 Celery Worker，支持 API 启动执行后异步投递 execution id，Worker 自动回传模拟结果，支持失败后的重试状态流转，验证了重复执行结果的幂等保护，加入了 Worker 临时基础设施异常的 Celery 自动重试策略，为执行结果回传增加了数据库行锁入口，把 Worker/队列监控指标接入了 Prometheus 和 Grafana，完成了任务取消与 Worker 迟到结果的第一版协调，新增了 Worker 心跳第一版，支持保存 Celery task id 与安全 revoke，加入了 Worker 周期性取消检查，能记录 revoke 事件审计，新增了 Celery 重试耗尽告警第一版、告警查询 API 和 Grafana Worker Alerts 面板，并为 Celery 主执行队列配置了 RabbitMQ DLQ 路由参数和 DLQ 拓扑声明，同时把 DLQ 消息数接入了 /metrics 和 Grafana，补上了安全 peek 的 DLQ 查询 API 第一版，新增了可重复运行的 DLQ 流转验证脚本，并已经完成 Docker/RabbitMQ 容器级实跑验证。
 ```
 
 尚未完成：
 
 ```text
-Worker 周期性取消检查
 独立周期性 Worker 心跳
-死信队列和重试耗尽告警
+Grafana Alerting 规则
 outbox pattern
 ```
 
@@ -1765,7 +2320,7 @@ outbox pattern
 阶段性整理、提交和 PR
 ```
 
-也就是把 Celery task id 记录和安全 revoke 整理成一次阶段性提交。
+也就是把 Worker 周期性取消检查、revoke 事件审计、Celery 重试耗尽告警、告警查询 API、Grafana 面板、DLQ 配置、DLQ 监控、DLQ 查询 API 和 DLQ 流转验证脚本整理成一次阶段性提交。
 
 ## 9. 后续学习计划
 

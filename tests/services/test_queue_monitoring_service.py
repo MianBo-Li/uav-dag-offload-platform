@@ -27,6 +27,7 @@ def _settings(**overrides: object) -> Settings:
         "rabbitmq_management_vhost": "/",
         "rabbitmq_management_timeout_seconds": 1.0,
         "celery_task_default_queue": "uav_dag_execution",
+        "celery_task_dead_letter_queue": "uav_dag_execution.dlq",
     }
     values.update(overrides)
     return Settings(**values)
@@ -42,6 +43,20 @@ def test_queue_monitoring_returns_disabled_snapshot() -> None:
     assert snapshot.available is False
     assert snapshot.messages == 0
     assert snapshot.consumers == 0
+
+
+def test_queue_monitoring_returns_disabled_snapshots() -> None:
+    snapshots = RabbitMQQueueMonitoringService(
+        _settings(rabbitmq_queue_monitoring_enabled=False)
+    ).load_snapshots()
+
+    assert [snapshot.queue_name for snapshot in snapshots] == [
+        "uav_dag_execution",
+        "uav_dag_execution.dlq",
+    ]
+    assert all(snapshot.enabled is False for snapshot in snapshots)
+    assert all(snapshot.available is False for snapshot in snapshots)
+    assert all(snapshot.messages == 0 for snapshot in snapshots)
 
 
 def test_queue_monitoring_reads_rabbitmq_queue_payload(monkeypatch) -> None:
@@ -79,6 +94,61 @@ def test_queue_monitoring_reads_rabbitmq_queue_payload(monkeypatch) -> None:
     assert snapshot.consumers == 1
 
 
+def test_queue_monitoring_reads_default_and_dead_letter_queue_payloads(
+    monkeypatch,
+) -> None:
+    captured_urls: list[str] = []
+    payloads = {
+        "http://rabbitmq:15672/api/queues/%2F/uav_dag_execution": b"""
+        {
+          "messages": 7,
+          "messages_ready": 5,
+          "messages_unacknowledged": 2,
+          "consumers": 1
+        }
+        """,
+        "http://rabbitmq:15672/api/queues/%2F/uav_dag_execution.dlq": b"""
+        {
+          "messages": 3,
+          "messages_ready": 3,
+          "messages_unacknowledged": 0,
+          "consumers": 0
+        }
+        """,
+    }
+
+    def fake_urlopen(request, timeout: float):
+        captured_urls.append(request.full_url)
+        assert timeout == 1.0
+        return FakeRabbitMQResponse(payloads[request.full_url])
+
+    monkeypatch.setattr(
+        "app.services.queue_monitoring_service.urlopen",
+        fake_urlopen,
+    )
+
+    snapshots = RabbitMQQueueMonitoringService(_settings()).load_snapshots()
+
+    assert captured_urls == [
+        "http://rabbitmq:15672/api/queues/%2F/uav_dag_execution",
+        "http://rabbitmq:15672/api/queues/%2F/uav_dag_execution.dlq",
+    ]
+    assert snapshots[0].queue_name == "uav_dag_execution"
+    assert snapshots[0].enabled is True
+    assert snapshots[0].available is True
+    assert snapshots[0].messages == 7
+    assert snapshots[0].messages_ready == 5
+    assert snapshots[0].messages_unacknowledged == 2
+    assert snapshots[0].consumers == 1
+    assert snapshots[1].queue_name == "uav_dag_execution.dlq"
+    assert snapshots[1].enabled is True
+    assert snapshots[1].available is True
+    assert snapshots[1].messages == 3
+    assert snapshots[1].messages_ready == 3
+    assert snapshots[1].messages_unacknowledged == 0
+    assert snapshots[1].consumers == 0
+
+
 def test_queue_monitoring_handles_unreachable_rabbitmq(monkeypatch) -> None:
     def fake_urlopen(request, timeout: float):
         raise URLError("rabbitmq unavailable")
@@ -96,3 +166,25 @@ def test_queue_monitoring_handles_unreachable_rabbitmq(monkeypatch) -> None:
     assert snapshot.messages_ready == 0
     assert snapshot.messages_unacknowledged == 0
     assert snapshot.consumers == 0
+
+
+def test_queue_monitoring_handles_unreachable_rabbitmq_for_all_queues(
+    monkeypatch,
+) -> None:
+    def fake_urlopen(request, timeout: float):
+        raise URLError("rabbitmq unavailable")
+
+    monkeypatch.setattr(
+        "app.services.queue_monitoring_service.urlopen",
+        fake_urlopen,
+    )
+
+    snapshots = RabbitMQQueueMonitoringService(_settings()).load_snapshots()
+
+    assert [snapshot.queue_name for snapshot in snapshots] == [
+        "uav_dag_execution",
+        "uav_dag_execution.dlq",
+    ]
+    assert all(snapshot.enabled is True for snapshot in snapshots)
+    assert all(snapshot.available is False for snapshot in snapshots)
+    assert all(snapshot.messages == 0 for snapshot in snapshots)

@@ -6,19 +6,22 @@ from app.db.models.task import (
     DagSubtask,
     DagTask,
     ExecutionRecord,
+    ExecutionRevokeEvent,
     SchedulePlan,
     SchedulePlanItem,
 )
-from app.db.models.worker import WorkerHeartbeat
+from app.db.models.worker import WorkerAlert, WorkerHeartbeat
 
 __all__ = [
     "DagDependency",
     "DagSubtask",
     "DagTask",
     "ExecutionRecord",
+    "ExecutionRevokeEvent",
     "Node",
     "NodeStatusRecord",
     "SchedulePlan",
     "SchedulePlanItem",
+    "WorkerAlert",
     "WorkerHeartbeat",
 ]

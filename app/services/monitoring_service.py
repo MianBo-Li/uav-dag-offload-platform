@@ -1,5 +1,6 @@
 from app.repositories.monitoring_repository import MonitoringRepository
 from app.services.queue_monitoring_service import RabbitMQQueueMonitoringService
+from app.services.worker_alert_service import WorkerAlertService
 from app.services.worker_heartbeat_service import WorkerHeartbeatService
 
 
@@ -9,17 +10,22 @@ class MonitoringService:
         repository: MonitoringRepository,
         queue_monitor: RabbitMQQueueMonitoringService | None = None,
         worker_heartbeat_service: WorkerHeartbeatService | None = None,
+        worker_alert_service: WorkerAlertService | None = None,
     ) -> None:
         self.repository = repository
         self.queue_monitor = queue_monitor or RabbitMQQueueMonitoringService()
         self.worker_heartbeat_service = worker_heartbeat_service or WorkerHeartbeatService(
             repository.db
         )
+        self.worker_alert_service = worker_alert_service or WorkerAlertService(
+            repository.db
+        )
 
     def render_prometheus_metrics(self) -> str:
         snapshot = self.repository.load_snapshot()
-        queue_snapshot = self.queue_monitor.load_snapshot()
+        queue_snapshots = self.queue_monitor.load_snapshots()
         worker_snapshot = self.worker_heartbeat_service.load_snapshot()
+        worker_alert_snapshot = self.worker_alert_service.load_snapshot()
         lines: list[str] = []
 
         _append_gauge(
@@ -167,45 +173,55 @@ class MonitoringService:
         )
         _append_labeled_gauge(
             lines,
+            "uav_dag_worker_alerts_total",
+            "Current number of worker alerts grouped by alert type.",
+            "alert_type",
+            worker_alert_snapshot.alerts_by_type,
+        )
+        _append_labeled_gauge(
+            lines,
             "uav_dag_queue_monitor_enabled",
             "Whether RabbitMQ queue monitoring is enabled.",
             "queue",
-            {queue_snapshot.queue_name: int(queue_snapshot.enabled)},
+            {snapshot.queue_name: int(snapshot.enabled) for snapshot in queue_snapshots},
         )
         _append_labeled_gauge(
             lines,
             "uav_dag_queue_monitor_available",
             "Whether RabbitMQ queue monitoring is currently reachable.",
             "queue",
-            {queue_snapshot.queue_name: int(queue_snapshot.available)},
+            {snapshot.queue_name: int(snapshot.available) for snapshot in queue_snapshots},
         )
         _append_labeled_gauge(
             lines,
             "uav_dag_queue_messages",
-            "Current RabbitMQ messages in the Celery execution queue.",
+            "Current RabbitMQ messages in Celery queues.",
             "queue",
-            {queue_snapshot.queue_name: queue_snapshot.messages},
+            {snapshot.queue_name: snapshot.messages for snapshot in queue_snapshots},
         )
         _append_labeled_gauge(
             lines,
             "uav_dag_queue_messages_ready",
-            "Current RabbitMQ ready messages in the Celery execution queue.",
+            "Current RabbitMQ ready messages in Celery queues.",
             "queue",
-            {queue_snapshot.queue_name: queue_snapshot.messages_ready},
+            {snapshot.queue_name: snapshot.messages_ready for snapshot in queue_snapshots},
         )
         _append_labeled_gauge(
             lines,
             "uav_dag_queue_messages_unacknowledged",
-            "Current RabbitMQ unacknowledged messages in the Celery execution queue.",
+            "Current RabbitMQ unacknowledged messages in Celery queues.",
             "queue",
-            {queue_snapshot.queue_name: queue_snapshot.messages_unacknowledged},
+            {
+                snapshot.queue_name: snapshot.messages_unacknowledged
+                for snapshot in queue_snapshots
+            },
         )
         _append_labeled_gauge(
             lines,
             "uav_dag_queue_consumers",
-            "Current RabbitMQ consumers attached to the Celery execution queue.",
+            "Current RabbitMQ consumers attached to Celery queues.",
             "queue",
-            {queue_snapshot.queue_name: queue_snapshot.consumers},
+            {snapshot.queue_name: snapshot.consumers for snapshot in queue_snapshots},
         )
 
         return "\n".join(lines) + "\n"

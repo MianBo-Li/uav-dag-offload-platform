@@ -13,6 +13,11 @@ services:
       CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
       CELERY_RESULT_BACKEND: redis://redis:6379/1
       CELERY_TASK_DEFAULT_QUEUE: uav_dag_execution
+      CELERY_TASK_DEFAULT_EXCHANGE: uav_dag_execution
+      CELERY_TASK_DEFAULT_ROUTING_KEY: uav_dag_execution
+      CELERY_TASK_DEAD_LETTER_EXCHANGE: uav_dag_execution.dlx
+      CELERY_TASK_DEAD_LETTER_ROUTING_KEY: uav_dag_execution.dead
+      CELERY_TASK_DEAD_LETTER_QUEUE: uav_dag_execution.dlq
       CELERY_EXECUTION_MAX_RETRIES: "3"
       CELERY_EXECUTION_RETRY_BACKOFF_SECONDS: "5"
       CELERY_EXECUTION_RETRY_BACKOFF_MAX_SECONDS: "60"
@@ -55,6 +60,11 @@ services:
       CELERY_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
       CELERY_RESULT_BACKEND: redis://redis:6379/1
       CELERY_TASK_DEFAULT_QUEUE: uav_dag_execution
+      CELERY_TASK_DEFAULT_EXCHANGE: uav_dag_execution
+      CELERY_TASK_DEFAULT_ROUTING_KEY: uav_dag_execution
+      CELERY_TASK_DEAD_LETTER_EXCHANGE: uav_dag_execution.dlx
+      CELERY_TASK_DEAD_LETTER_ROUTING_KEY: uav_dag_execution.dead
+      CELERY_TASK_DEAD_LETTER_QUEUE: uav_dag_execution.dlq
       CELERY_EXECUTION_MAX_RETRIES: "3"
       CELERY_EXECUTION_RETRY_BACKOFF_SECONDS: "5"
       CELERY_EXECUTION_RETRY_BACKOFF_MAX_SECONDS: "60"
@@ -70,7 +80,8 @@ services:
       HEARTBEAT_TIMEOUT_SECONDS: "30"
       WORKER_HEARTBEAT_TIMEOUT_SECONDS: "60"
       DEFAULT_SCHEDULER_STRATEGY: greedy
-    command: celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=1
+    command: >
+      sh -c "celery -A app.worker.celery_app:celery_app worker --loglevel=INFO --concurrency=1 --queues=$${CELERY_TASK_DEFAULT_QUEUE}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, Uuid, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, Numeric, String, Text, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -228,4 +228,23 @@ class ExecutionRecord(Base):
     subtask: Mapped[DagSubtask] = relationship(back_populates="execution_records")
     plan_item: Mapped[SchedulePlanItem | None] = relationship(
         back_populates="execution_records"
+    )
+
+
+class ExecutionRevokeEvent(Base):
+    __tablename__ = "execution_revoke_events"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    task_id: Mapped[UUID] = mapped_column(ForeignKey("dag_tasks.id"), nullable=False, index=True)
+    execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("execution_records.id"),
+        nullable=False,
+        index=True,
+    )
+    celery_task_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )

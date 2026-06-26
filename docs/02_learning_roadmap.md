@@ -212,13 +212,22 @@
 -> 任务取消与 Worker 执行协调
 -> Worker 心跳第一版
 -> 保存 Celery task id 与安全 revoke
+-> Worker 周期性取消检查
+-> revoke 事件审计
+-> Celery 重试耗尽告警第一版
+-> Worker 告警查询 API
+-> RabbitMQ DLQ 配置第一版
+-> DLQ 监控指标第一版
+-> DLQ 查询 API 第一版
+-> DLQ 流转验证脚本
+-> DLQ 容器级实跑验证
 ```
 
 当前最应该做的是：
 
-1. 阶段性整理当前 Celery task id 记录和安全 revoke 成果，保证测试、文档和 Docker 配置验证一致。
+1. 阶段性整理当前取消协作、revoke 审计、重试耗尽告警、DLQ 配置、DLQ 监控、DLQ 查询 API 和 DLQ 容器级验证成果，保证测试、文档和数据库迁移验证一致。
 2. 做一次清晰提交或 PR，把这一阶段成果固化下来。
-3. 进入下一阶段增强：Worker 周期性取消检查、死信队列和告警。
+3. 进入下一阶段增强：Grafana Alerting 规则、DLQ 消息重放/处理策略和 outbox pattern。
 
 后续开发应继续遵循：
 

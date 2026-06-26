@@ -2,8 +2,10 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.db.models.task import ExecutionRevokeEvent
 from app.db.models.node import Node, NodeStatusRecord
 from app.domain.enums import (
     ExecutionStatus,
@@ -142,3 +144,35 @@ def test_cancel_running_execution_revokes_celery_task(db_session: Session) -> No
     )
 
     assert revoker.revoked_ids == ["celery-task-123"]
+
+    events = list(db_session.scalars(select(ExecutionRevokeEvent)))
+    assert len(events) == 1
+    assert events[0].task_id == record.task_id
+    assert events[0].execution_id == record.id
+    assert events[0].celery_task_id == "celery-task-123"
+    assert events[0].success is True
+    assert events[0].error_message is None
+
+
+def test_cancel_running_execution_records_failed_revoke_event(
+    db_session: Session,
+) -> None:
+    execution_id = _start_ready_execution(db_session)
+    record = ExecutionRepository(db_session).get_plain_by_id(execution_id)
+    assert record is not None
+    record.celery_task_id = "celery-task-123"
+
+    class FakeExecutionRevoker:
+        def revoke(self, celery_task_id: str) -> bool:
+            assert celery_task_id == "celery-task-123"
+            return False
+
+    TaskService(db_session, execution_revoker=FakeExecutionRevoker()).cancel_task(
+        record.task_id,
+        DagTaskCancelRequest(reason="operator canceled during execution"),
+    )
+
+    events = list(db_session.scalars(select(ExecutionRevokeEvent)))
+    assert len(events) == 1
+    assert events[0].success is False
+    assert events[0].error_message == "Celery revoke returned false"

@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
+from uuid import UUID
 
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.domain.enums import WorkerStatus
+from app.services.worker_alert_service import WorkerAlertService
 from app.services.worker_heartbeat_service import WorkerHeartbeatService
 
 
@@ -68,11 +70,20 @@ def test_prometheus_metrics_empty_database(client: TestClient) -> None:
     assert "uav_dag_workers_online 0" in body
     assert "uav_dag_worker_latest_seen_timestamp 0" in body
     assert 'uav_dag_queue_monitor_enabled{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_monitor_enabled{queue="uav_dag_execution.dlq"} 0' in body
     assert 'uav_dag_queue_monitor_available{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_monitor_available{queue="uav_dag_execution.dlq"} 0' in body
     assert 'uav_dag_queue_messages{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_messages{queue="uav_dag_execution.dlq"} 0' in body
     assert 'uav_dag_queue_messages_ready{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_messages_ready{queue="uav_dag_execution.dlq"} 0' in body
     assert 'uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution"} 0' in body
+    assert (
+        'uav_dag_queue_messages_unacknowledged{queue="uav_dag_execution.dlq"} 0'
+        in body
+    )
     assert 'uav_dag_queue_consumers{queue="uav_dag_execution"} 0' in body
+    assert 'uav_dag_queue_consumers{queue="uav_dag_execution.dlq"} 0' in body
 
 
 def test_prometheus_metrics_after_execution(client: TestClient) -> None:
@@ -132,3 +143,27 @@ def test_prometheus_metrics_after_worker_heartbeat(
     assert "uav_dag_workers_total 1" in body
     assert 'uav_dag_workers_by_status_total{status="BUSY"} 1' in body
     assert f"uav_dag_worker_latest_seen_timestamp {int(reported_at.timestamp())}" in body
+
+
+def test_prometheus_metrics_after_worker_alert(
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    WorkerAlertService(db_session).report_retry_exhausted(
+        execution_id=UUID("00000000-0000-0000-0000-000000000001"),
+        worker_name="worker-a",
+        celery_task_id="celery-task-123",
+        retry_count=3,
+        max_retries=3,
+        exc=RuntimeError("database unavailable"),
+    )
+    db_session.commit()
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert (
+        'uav_dag_worker_alerts_total{alert_type="CELERY_RETRY_EXHAUSTED"} 1'
+        in body
+    )

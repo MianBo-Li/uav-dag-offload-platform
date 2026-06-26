@@ -23,7 +23,12 @@ class RabbitMQQueueMonitoringService:
         self.settings = settings or get_settings()
 
     def load_snapshot(self) -> QueueMonitoringSnapshot:
-        queue_name = self.settings.celery_task_default_queue
+        return self._load_snapshot(self.settings.celery_task_default_queue)
+
+    def load_snapshots(self) -> list[QueueMonitoringSnapshot]:
+        return [self._load_snapshot(queue_name) for queue_name in self._queue_names()]
+
+    def _load_snapshot(self, queue_name: str) -> QueueMonitoringSnapshot:
         if not self.settings.rabbitmq_queue_monitoring_enabled:
             return _empty_snapshot(queue_name, enabled=False)
 
@@ -42,13 +47,20 @@ class RabbitMQQueueMonitoringService:
             consumers=_int_value(payload, "consumers"),
         )
 
+    def _queue_names(self) -> list[str]:
+        queue_names = [
+            self.settings.celery_task_default_queue,
+            self.settings.celery_task_dead_letter_queue,
+        ]
+        return list(dict.fromkeys(queue_names))
+
     def _fetch_queue_payload(self, queue_name: str) -> dict[str, object]:
         url = self._queue_url(queue_name)
         request = Request(url)
         request.add_header("Accept", "application/json")
         request.add_header(
             "Authorization",
-            _basic_auth_header(
+            build_basic_auth_header(
                 self.settings.rabbitmq_management_username,
                 self.settings.rabbitmq_management_password,
             ),
@@ -92,7 +104,7 @@ def _int_value(payload: dict[str, object], key: str) -> int:
     return 0
 
 
-def _basic_auth_header(username: str, password: str) -> str:
+def build_basic_auth_header(username: str, password: str) -> str:
     import base64
 
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
